@@ -1,0 +1,71 @@
+name: Bug report
+description: Something does not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Transfers fail for entirely different reasons on different networks, so
+        the network details below genuinely matter. See docs/NETWORKING.md.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the site on a laptop
+        2. Create a flight
+        3. Open it on a phone
+    validations:
+      required: true
+
+  - type: dropdown
+    id: network
+    attributes:
+      label: Which network?
+      description: This is often the whole answer.
+      options:
+        - Home Wi-Fi
+        - Mobile hotspot
+        - Campus / university Wi-Fi
+        - Office / corporate network
+        - Mobile data (4G / 5G)
+        - VPN
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: browsers
+    attributes:
+      label: Devices and browsers
+      description: e.g. "Pixel 8 on Chrome, MacBook Air on Safari 17"
+    validations:
+      required: true
+
+  - type: textarea
+    id: console
+    attributes:
+      label: Console output
+      description: Anything in the browser console. For connection failures, the
+        (connectionState, iceConnectionState) pair from chrome://webrtc-internals
+        is the most useful thing you can include.
+    render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Have you checked
+      options:
+        - label: The issue still happens after a hard refresh
+          required: false
+        - label: I read docs/NETWORKING.md
+          required: false

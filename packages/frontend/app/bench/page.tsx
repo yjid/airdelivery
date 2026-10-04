@@ -5,10 +5,7 @@ import { useSocket } from '@/context/socketContext';
 
 type Result = { mb: number; seconds: number; mbps: number } | null;
 
-const ICE = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-];
+const ICE = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
 
 export default function BenchPage() {
   const { socket } = useSocket();
@@ -25,7 +22,7 @@ export default function BenchPage() {
   const remoteIdRef = useRef('');
   // Separate queues — mixing these was causing the 1-minute delay
   const pendingOut = useRef<RTCIceCandidateInit[]>([]); // host's own candidates before remote id is known
-  const pendingIn = useRef<RTCIceCandidateInit[]>([]);  // remote's candidates before remote desc is set
+  const pendingIn = useRef<RTCIceCandidateInit[]>([]); // remote's candidates before remote desc is set
 
   const removeListeners = useCallback(() => {
     socket?.off('flightUsers');
@@ -120,12 +117,15 @@ export default function BenchPage() {
     setStatus('Joining…');
 
     socket.emit('joinFlight', code, (resp: { success: boolean; message?: string }) => {
-      if (!resp.success) { setStatus(`Could not join: ${resp.message}`); return; }
+      if (!resp.success) {
+        setStatus(`Could not join: ${resp.message}`);
+        return;
+      }
       setStatus('Waiting for host…');
     });
 
-    socket.once('offer', async (id: string, { sdp }: { sdp: any }) => {
-      const desc = sdp?.sdp ?? sdp;
+    socket.once('offer', async (id: string, { sdp }: { sdp?: { sdp?: string } | string }) => {
+      const desc = typeof sdp === 'string' ? sdp : (sdp?.sdp ?? undefined);
       if (!desc) {
         setStatus('Offer not ready — retrying…');
         setTimeout(() => socket.emit('joinFlight', code, () => {}), 1500);
@@ -155,7 +155,10 @@ export default function BenchPage() {
         let started = 0;
         channel.onmessage = ({ data }) => {
           if (typeof data === 'string') {
-            if (data === 'start') { started = performance.now(); setStatus('Receiving…'); }
+            if (data === 'start') {
+              started = performance.now();
+              setStatus('Receiving…');
+            }
             return;
           }
           received += (data as ArrayBuffer).byteLength;
@@ -174,7 +177,7 @@ export default function BenchPage() {
         else pendingIn.current.push(candidate);
       });
 
-      await pc.setRemoteDescription(desc);
+      await pc.setRemoteDescription({ type: 'offer', sdp: desc });
       // Flush any candidates that raced ahead of setRemoteDescription
       for (const c of pendingIn.current) await pc.addIceCandidate(c);
       pendingIn.current = [];
@@ -201,7 +204,12 @@ export default function BenchPage() {
     let paused = false;
 
     dc.bufferedAmountLowThreshold = highWater / 2;
-    dc.onbufferedamountlow = () => { if (paused) { paused = false; pump(); } };
+    dc.onbufferedamountlow = () => {
+      if (paused) {
+        paused = false;
+        pump();
+      }
+    };
 
     setResult(null);
     setStatus(`Sending ${totalMB} MB…`);
@@ -209,7 +217,10 @@ export default function BenchPage() {
 
     function pump() {
       while (sent < totalBytes) {
-        if (dc!.bufferedAmount > highWater) { paused = true; return; }
+        if (dc!.bufferedAmount > highWater) {
+          paused = true;
+          return;
+        }
         dc!.send(buf);
         sent += chunkSize;
       }
@@ -233,15 +244,45 @@ export default function BenchPage() {
           placeholder="room code"
           className="rounded border px-2 py-1 w-32"
         />
-        <button onClick={host} className="rounded bg-black px-3 py-1 text-white">Host</button>
-        <button onClick={join} className="rounded bg-black px-3 py-1 text-white">Join</button>
+        <button onClick={host} className="rounded bg-black px-3 py-1 text-white">
+          Host
+        </button>
+        <button onClick={join} className="rounded bg-black px-3 py-1 text-white">
+          Join
+        </button>
       </div>
 
       <div className="flex flex-wrap items-center gap-3">
-        <label>chunk KB <input type="number" value={chunkKB} onChange={(e) => setChunkKB(+e.target.value)} className="w-20 rounded border px-1" /></label>
-        <label>buffer MB <input type="number" value={bufferMB} onChange={(e) => setBufferMB(+e.target.value)} className="w-20 rounded border px-1" /></label>
-        <label>total MB  <input type="number" value={totalMB}  onChange={(e) => setTotalMB(+e.target.value)}  className="w-20 rounded border px-1" /></label>
-        <button onClick={run} className="rounded bg-green-600 px-3 py-1 text-white">Run</button>
+        <label>
+          chunk KB{' '}
+          <input
+            type="number"
+            value={chunkKB}
+            onChange={(e) => setChunkKB(+e.target.value)}
+            className="w-20 rounded border px-1"
+          />
+        </label>
+        <label>
+          buffer MB{' '}
+          <input
+            type="number"
+            value={bufferMB}
+            onChange={(e) => setBufferMB(+e.target.value)}
+            className="w-20 rounded border px-1"
+          />
+        </label>
+        <label>
+          total MB{' '}
+          <input
+            type="number"
+            value={totalMB}
+            onChange={(e) => setTotalMB(+e.target.value)}
+            className="w-20 rounded border px-1"
+          />
+        </label>
+        <button onClick={run} className="rounded bg-green-600 px-3 py-1 text-white">
+          Run
+        </button>
       </div>
 
       {/* Status + Result */}

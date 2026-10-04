@@ -1,0 +1,11 @@
+# Default reviewers for everything. Replace the handles with the project's
+# maintainers as they join.
+*                       @GochiStuff
+
+# Areas that need extra care. A change touching these should get a second pair
+# of eyes, because mistakes here are the ones users actually notice.
+/packages/backend/src/socket/  @GochiStuff
+/packages/backend/src/services/ @GochiStuff
+/packages/frontend/lib/transfer/ @GochiStuff
+/packages/frontend/hooks/       @GochiStuff
+/packages/protocol/             @GochiStuff

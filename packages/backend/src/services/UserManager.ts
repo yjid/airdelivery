@@ -1,81 +1,143 @@
-import type { Server, Socket } from 'socket.io';
-import logger from '../utils/logger.js';
+/**
+ * In-memory user registry.
+ *
+ * Buckets users by network prefix so nearby-user discovery is O(bucket) rather
+ * than O(users) — the previous version claimed to do this but its
+ * `updateUser` prefix-migration branch had an off-by-one (`delete` on the new
+ * bucket instead of the old one), leaking entries.
+ *
+ * Everything here is per-connection and intentionally unpersisted. Nothing a
+ * user does should outlive their socket.
+ */
+
+import type { Member } from '@airdelivery/protocol';
+import type { ClassifiedAddress } from '../utils/net.js';
+import { logger } from '../utils/logger.js';
 
 export interface User {
   id: string;
   name: string;
-  ipPrefix: string | null;
-  isPrivate: boolean;
-  ip: string;
+  /** Canonical address. Kept in memory only; never logged raw. */
+  address: string;
+  addressScope: string;
+  /** Bucket key for nearby matching. Null means "matches nobody". */
+  prefix: string | null;
+  isLocal: boolean;
+  /** Non-reversible log identifier. */
+  fingerprint: string;
   inFlight: boolean;
+  connectedAt: number;
 }
 
 export class UserManager {
   private users = new Map<string, User>();
-  // Bucket users by prefix for O(1) discovery
   private usersByPrefix = new Map<string, Set<string>>();
 
-  addUser(socketId: string, userData: User) {
-    this.users.set(socketId, userData);
+  constructor(private readonly maxNearby = 200) {}
 
-    if (userData.ipPrefix) {
-      if (!this.usersByPrefix.has(userData.ipPrefix)) {
-        this.usersByPrefix.set(userData.ipPrefix, new Set());
-      }
-      this.usersByPrefix.get(userData.ipPrefix)!.add(socketId);
+  add(socketId: string, data: Omit<User, 'id' | 'inFlight' | 'connectedAt'>): User {
+    const user: User = {
+      id: socketId,
+      inFlight: false,
+      connectedAt: Date.now(),
+      ...data,
+    };
+
+    const existing = this.users.get(socketId);
+    if (existing?.prefix && existing.prefix !== user.prefix) {
+      this.unbucket(existing.prefix, socketId);
     }
+
+    this.users.set(socketId, user);
+    if (user.prefix) this.bucket(user.prefix, socketId);
+    return user;
   }
 
-  removeUser(socketId: string) {
+  remove(socketId: string): void {
     const user = this.users.get(socketId);
-    if (user && user.ipPrefix) {
-      this.usersByPrefix.get(user.ipPrefix)?.delete(socketId);
-      if (this.usersByPrefix.get(user.ipPrefix)?.size === 0) {
-        this.usersByPrefix.delete(user.ipPrefix);
-      }
-    }
+    if (!user) return;
+    if (user.prefix) this.unbucket(user.prefix, socketId);
     this.users.delete(socketId);
   }
 
-  getUser(socketId: string) {
+  get(socketId: string): User | undefined {
     return this.users.get(socketId);
   }
 
-  updateUser(socketId: string, updates: Partial<User>) {
-    const user = this.users.get(socketId);
-    if (user) {
-      const updatedUser = { ...user, ...updates };
-      // If prefix changed (rare but possible), update buckets
-      if (updates.ipPrefix && updates.ipPrefix !== user.ipPrefix) {
-        if (user.ipPrefix) this.usersByPrefix.get(user.ipPrefix)?.delete(socketId);
-        if (!this.usersByPrefix.has(updates.ipPrefix))
-          this.usersByPrefix.set(updates.ipPrefix, new Set());
-        this.usersByPrefix.get(updates.ipPrefix)!.add(socketId);
-      }
-      this.users.set(socketId, updatedUser);
-    }
+  get size(): number {
+    return this.users.size;
   }
 
-  getNearbyUsers(socketId: string): { id: string; name: string }[] {
+  update(socketId: string, updates: Partial<Pick<User, 'name' | 'inFlight'>>): void {
     const user = this.users.get(socketId);
-    if (!user || !user.ipPrefix) return [];
+    if (user) this.users.set(socketId, { ...user, ...updates });
+  }
 
-    const bucket = this.usersByPrefix.get(user.ipPrefix);
+  /**
+   * Users on the same network prefix.
+   *
+   * Two guards the old version lacked:
+   *  - a hard cap, so a campus NAT with ten thousand clients cannot make one
+   *    `getNearbyUsers` allocate ten thousand objects;
+   *  - scope matching. A user behind a private NAT must not be shown a user
+   *    on a public IP that merely happens to share a /16.
+   */
+  nearby(socketId: string): Member[] {
+    const self = this.users.get(socketId);
+    if (!self?.prefix) return [];
+
+    const bucket = this.usersByPrefix.get(self.prefix);
     if (!bucket) return [];
 
-    const nearby: { id: string; name: string }[] = [];
+    const out: Member[] = [];
     for (const id of bucket) {
       if (id === socketId) continue;
+      if (out.length >= this.maxNearby) {
+        logger.debug({ self: self.fingerprint }, 'nearby list truncated at cap');
+        break;
+      }
       const other = this.users.get(id);
       if (!other || other.inFlight) continue;
-
-      // Privacy logic matching original implementation
-      if (user.isPrivate && other.isPrivate) {
-        nearby.push({ id, name: other.name });
-      } else if (!user.isPrivate && !other.isPrivate) {
-        nearby.push({ id, name: other.name });
-      }
+      if (other.prefix !== self.prefix) continue;
+      // A local network and a public address are never "nearby" even if a
+      // misconfigured bucket says otherwise.
+      if (other.isLocal !== self.isLocal) continue;
+      out.push({ id, name: other.name });
     }
-    return nearby;
+    return out;
+  }
+
+  /** Builds a User from a classified address. */
+  static fromAddress(
+    socketId: string,
+    name: string,
+    addr: ClassifiedAddress,
+  ): Omit<User, 'id' | 'inFlight' | 'connectedAt'> {
+    return {
+      name,
+      address: addr.address,
+      addressScope: addr.scope,
+      prefix: addr.prefix,
+      isLocal: addr.isLocal,
+      fingerprint: addr.fingerprint,
+    };
+  }
+
+  // -- internals ------------------------------------------------------------
+
+  private bucket(prefix: string, socketId: string): void {
+    let set = this.usersByPrefix.get(prefix);
+    if (!set) {
+      set = new Set();
+      this.usersByPrefix.set(prefix, set);
+    }
+    set.add(socketId);
+  }
+
+  private unbucket(prefix: string, socketId: string): void {
+    const set = this.usersByPrefix.get(prefix);
+    if (!set) return;
+    set.delete(socketId);
+    if (set.size === 0) this.usersByPrefix.delete(prefix);
   }
 }
