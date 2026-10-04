@@ -16,7 +16,7 @@
  * flight.
  */
 
-import { createServer, type Server as HttpServer } from 'node:http';
+import { createServer } from 'node:http';
 import { Server as IOServer } from 'socket.io';
 import { createApp } from './app.js';
 import { FlightManager } from './services/FlightManager.js';
@@ -149,7 +149,10 @@ export async function shutdown(reason = 'signal'): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  logger.info({ reason, uncaught: counters.uncaught, rejections: counters.rejections }, 'shutting down');
+  logger.info(
+    { reason, uncaught: counters.uncaught, rejections: counters.rejections },
+    'shutting down',
+  );
 
   const force = setTimeout(() => {
     logger.warn('shutdown deadline exceeded — forcing exit');

@@ -159,7 +159,10 @@ export function createApp(): Express {
       });
     }
 
-    const status = typeof (err as { status?: number })?.status === 'number' ? (err as { status: number }).status : 500;
+    const status =
+      typeof (err as { status?: number })?.status === 'number'
+        ? (err as { status: number }).status
+        : 500;
     if (status >= 500) {
       logger.error({ err, path: req.path, method: req.method }, 'request failed');
     }

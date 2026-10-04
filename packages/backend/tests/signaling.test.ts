@@ -47,7 +47,10 @@ function connect(): Promise<ClientSocket> {
 
 function once<T = unknown>(socket: ClientSocket, event: string, timeoutMs = 3000): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out waiting for "${event}"`)), timeoutMs);
+    const timer = setTimeout(
+      () => reject(new Error(`timed out waiting for "${event}"`)),
+      timeoutMs,
+    );
     socket.once(event, (payload: T) => {
       clearTimeout(timer);
       resolve(payload);
@@ -58,7 +61,10 @@ function once<T = unknown>(socket: ClientSocket, event: string, timeoutMs = 3000
 /** Captures every argument of a multi-arg event, e.g. `offer(id, sdp)`. */
 function onceAll(socket: ClientSocket, event: string, timeoutMs = 3000): Promise<unknown[]> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out waiting for "${event}"`)), timeoutMs);
+    const timer = setTimeout(
+      () => reject(new Error(`timed out waiting for "${event}"`)),
+      timeoutMs,
+    );
     socket.once(event, (...args: unknown[]) => {
       clearTimeout(timer);
       resolve(args);

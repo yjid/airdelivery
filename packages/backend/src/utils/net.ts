@@ -299,7 +299,10 @@ function prefixFor(
   if (version === 6 && groups) {
     const bits = LOCAL_SCOPES.has(scope) ? 64 : 48;
     const hextets = bits / 16;
-    return `${groups.slice(0, hextets).map((g) => g.toString(16)).join(':')}::/${bits}`;
+    return `${groups
+      .slice(0, hextets)
+      .map((g) => g.toString(16))
+      .join(':')}::/${bits}`;
   }
 
   return null;

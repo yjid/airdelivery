@@ -108,7 +108,11 @@ export class UserManager {
   }
 
   /** Builds a User from a classified address. */
-  static fromAddress(socketId: string, name: string, addr: ClassifiedAddress): Omit<User, 'id' | 'inFlight' | 'connectedAt'> {
+  static fromAddress(
+    socketId: string,
+    name: string,
+    addr: ClassifiedAddress,
+  ): Omit<User, 'id' | 'inFlight' | 'connectedAt'> {
     return {
       name,
       address: addr.address,

@@ -114,29 +114,24 @@ export function registerSocketHandlers(io: Server, deps: HandlerDeps): void {
     );
 
     // -- flight creation ---------------------------------------------------
-    onBounded(
-      socket,
-      EV.createFlight,
-      COST.create,
-      async (socketId, ack: (a: Ack) => void) => {
-        // Re-joining instead of creating a second flight keeps a double-tap or
-        // a retried frame from leaking an orphaned room.
-        const existing = flights.flightsFor(socketId);
-        if (existing.length > 0) {
-          return ack(ackOk({ code: existing[0] }));
-        }
+    onBounded(socket, EV.createFlight, COST.create, async (socketId, ack: (a: Ack) => void) => {
+      // Re-joining instead of creating a second flight keeps a double-tap or
+      // a retried frame from leaking an orphaned room.
+      const existing = flights.flightsFor(socketId);
+      if (existing.length > 0) {
+        return ack(ackOk({ code: existing[0] }));
+      }
 
-        const code = generateUniqueCode((c) => flights.hasFlight(c));
-        flights.createFlight(code, socketId);
-        stats.incFlights();
+      const code = generateUniqueCode((c) => flights.hasFlight(c));
+      flights.createFlight(code, socketId);
+      stats.incFlights();
 
-        // `join` is async in Socket.IO v4. Broadcasting before it resolves
-        // races the room membership and the client never sees flightUsers.
-        await socket.join(code);
-        ack(ackOk({ code }));
-        broadcastUsers(code);
-      },
-    );
+      // `join` is async in Socket.IO v4. Broadcasting before it resolves
+      // races the room membership and the client never sees flightUsers.
+      await socket.join(code);
+      ack(ackOk({ code }));
+      broadcastUsers(code);
+    });
 
     // -- flight joining ----------------------------------------------------
     onBounded(
@@ -196,74 +191,59 @@ export function registerSocketHandlers(io: Server, deps: HandlerDeps): void {
     // second argument is an instant TypeError, and an uncaught TypeError in a
     // Socket.IO listener terminates the process. One stale tab could restart
     // the service for everyone.
-    onBounded(
-      socket,
-      EV.offer,
-      COST.signal,
-      (socketId, rawCode: unknown, rawSdp: unknown) => {
-        const code = FlightCodeSchema.safeParse(rawCode);
-        const sdp = SdpSchema.safeParse(rawSdp);
-        if (!code.success || !sdp.success) return;
+    onBounded(socket, EV.offer, COST.signal, (socketId, rawCode: unknown, rawSdp: unknown) => {
+      const code = FlightCodeSchema.safeParse(rawCode);
+      const sdp = SdpSchema.safeParse(rawSdp);
+      if (!code.success || !sdp.success) return;
 
-        if (!flights.isMember(code.data, socketId)) return;
-        if (!flights.setSdp(code.data, socketId, sdp.data)) return;
+      if (!flights.isMember(code.data, socketId)) return;
+      if (!flights.setSdp(code.data, socketId, sdp.data)) return;
 
-        const peerId = flights.getPeer(code.data, socketId);
-        if (!peerId) {
-          // Nothing to negotiate with yet. Not an error — the owner offers
-          // before anyone joins and the offer is replayed on join.
-          log.debug({ code: code.data }, 'offer stored, no peer yet');
-          return;
-        }
-        io.to(peerId).emit(EV.offer, socketId, sdp.data);
-      },
-    );
+      const peerId = flights.getPeer(code.data, socketId);
+      if (!peerId) {
+        // Nothing to negotiate with yet. Not an error — the owner offers
+        // before anyone joins and the offer is replayed on join.
+        log.debug({ code: code.data }, 'offer stored, no peer yet');
+        return;
+      }
+      io.to(peerId).emit(EV.offer, socketId, sdp.data);
+    });
 
-    onBounded(
-      socket,
-      EV.answer,
-      COST.signal,
-      (socketId, rawCode: unknown, rawSdp: unknown) => {
-        const code = FlightCodeSchema.safeParse(rawCode);
-        const sdp = SdpSchema.safeParse(rawSdp);
-        if (!code.success || !sdp.success) return;
+    onBounded(socket, EV.answer, COST.signal, (socketId, rawCode: unknown, rawSdp: unknown) => {
+      const code = FlightCodeSchema.safeParse(rawCode);
+      const sdp = SdpSchema.safeParse(rawSdp);
+      if (!code.success || !sdp.success) return;
 
-        if (!flights.isMember(code.data, socketId)) return;
-        flights.setSdp(code.data, socketId, sdp.data);
+      if (!flights.isMember(code.data, socketId)) return;
+      flights.setSdp(code.data, socketId, sdp.data);
 
-        const peerId = flights.getPeer(code.data, socketId);
-        if (!peerId) return;
-        io.to(peerId).emit(EV.answer, { id: socketId, sdp: sdp.data });
-      },
-    );
+      const peerId = flights.getPeer(code.data, socketId);
+      if (!peerId) return;
+      io.to(peerId).emit(EV.answer, { id: socketId, sdp: sdp.data });
+    });
 
     /**
      * ICE candidates are volume-heavy by nature — a typical connection emits
      * dozens. They get the cheapest validation and a relay counter so a
      * client cannot flood the server with millions of tiny frames.
      */
-    onBounded(
-      socket,
-      EV.iceCandidate,
-      COST.ice,
-      (socketId, raw: unknown) => {
-        if (!raw || typeof raw !== 'object') return;
-        const payload = raw as { id?: unknown; candidate?: unknown };
+    onBounded(socket, EV.iceCandidate, COST.ice, (socketId, raw: unknown) => {
+      if (!raw || typeof raw !== 'object') return;
+      const payload = raw as { id?: unknown; candidate?: unknown };
 
-        const targetId = SocketIdSchema.safeParse(payload.id);
-        const candidate = IceCandidateSchema.safeParse(payload.candidate);
-        if (!targetId.success || !candidate.success) return;
+      const targetId = SocketIdSchema.safeParse(payload.id);
+      const candidate = IceCandidateSchema.safeParse(payload.candidate);
+      if (!targetId.success || !candidate.success) return;
 
-        // Membership is proven by sharing a flight with the target. A client
-        // must not be able to inject ICE into an arbitrary peer's connection.
-        const sharesFlight = flights
-          .flightsFor(socketId)
-          .some((code) => flights.getPeer(code, socketId) === targetId.data);
-        if (!sharesFlight) return;
+      // Membership is proven by sharing a flight with the target. A client
+      // must not be able to inject ICE into an arbitrary peer's connection.
+      const sharesFlight = flights
+        .flightsFor(socketId)
+        .some((code) => flights.getPeer(code, socketId) === targetId.data);
+      if (!sharesFlight) return;
 
-        io.to(targetId.data).emit(EV.iceCandidate, { id: socketId, candidate: candidate.data });
-      },
-    );
+      io.to(targetId.data).emit(EV.iceCandidate, { id: socketId, candidate: candidate.data });
+    });
 
     // -- invitations -------------------------------------------------------
     onBounded(
@@ -288,7 +268,10 @@ export function registerSocketHandlers(io: Server, deps: HandlerDeps): void {
         if (!users.get(targetId)) return ack(ackErr('OFFLINE', 'That device is no longer online'));
 
         const flight = flights.getFlight(flightCode)!;
-        if (flight.members.length >= LIMITS.MAX_FLIGHT_MEMBERS && !flight.members.includes(targetId)) {
+        if (
+          flight.members.length >= LIMITS.MAX_FLIGHT_MEMBERS &&
+          !flight.members.includes(targetId)
+        ) {
           return ack(ackErr('FULL', 'That flight already has both devices'));
         }
 
@@ -317,7 +300,8 @@ export function registerSocketHandlers(io: Server, deps: HandlerDeps): void {
         const target = SocketIdSchema.safeParse(targetId);
         if (!target.success) return ack(ackErr('BAD_PAYLOAD', 'Invalid device'));
         if (target.data === socketId) return ack(ackErr('SELF', 'You cannot connect to yourself'));
-        if (!users.get(target.data)) return ack(ackErr('OFFLINE', 'That device is no longer online'));
+        if (!users.get(target.data))
+          return ack(ackErr('OFFLINE', 'That device is no longer online'));
 
         const code = generateUniqueCode((c) => flights.hasFlight(c));
         flights.createFlight(code, socketId);
@@ -343,17 +327,12 @@ export function registerSocketHandlers(io: Server, deps: HandlerDeps): void {
     });
 
     // -- stats -------------------------------------------------------------
-    onBounded(
-      socket,
-      EV.updateStats,
-      COST.stats,
-      (_socketId, raw: unknown) => {
-        const parsed = UpdateStatsClientSchema.safeParse([raw]);
-        if (!parsed.success) return;
-        const [payload] = parsed.data;
-        stats.incTransfer(payload.filesShared ?? 0, payload.bytesTransferred ?? 0);
-      },
-    );
+    onBounded(socket, EV.updateStats, COST.stats, (_socketId, raw: unknown) => {
+      const parsed = UpdateStatsClientSchema.safeParse([raw]);
+      if (!parsed.success) return;
+      const [payload] = parsed.data;
+      stats.incTransfer(payload.filesShared ?? 0, payload.bytesTransferred ?? 0);
+    });
 
     // -- teardown ----------------------------------------------------------
     // The single most important handler in the file. The old version called

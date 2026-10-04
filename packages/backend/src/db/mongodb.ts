@@ -25,7 +25,12 @@ export function isDbConnecting(): boolean {
   return mongoose.connection.readyState === 2;
 }
 
-export function dbState(): 'disconnected' | 'connected' | 'connecting' | 'disconnecting' | 'unknown' {
+export function dbState():
+  | 'disconnected'
+  | 'connected'
+  | 'connecting'
+  | 'disconnecting'
+  | 'unknown' {
   switch (mongoose.connection.readyState) {
     case 0:
       return 'disconnected';

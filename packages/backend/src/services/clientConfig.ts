@@ -16,15 +16,9 @@ import {
   MAX_CHUNK_BYTES,
   PARALLEL_CHANNELS,
   TURN_AVAILABLE,
-  TURN_CREDENTIAL,
   TURN_URLS,
-  TURN_USERNAME,
 } from '../config/index.js';
-import {
-  LIMITS,
-  type ClientConfig,
-  type IceServerConfig,
-} from '@airdelivery/protocol';
+import { LIMITS, type ClientConfig, type IceServerConfig } from '@airdelivery/protocol';
 
 let cached: ClientConfig | null = null;
 

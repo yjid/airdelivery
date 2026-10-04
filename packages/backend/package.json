@@ -30,6 +30,7 @@
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.3",
     "pino-pretty": "^13.0.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "@types/bun": "latest"
   }
 }

@@ -21,7 +21,7 @@
  * process keeps serving every other connection.
  */
 
-import type { Server, Socket } from 'socket.io';
+import type { Socket } from 'socket.io';
 import type { Ack } from '@airdelivery/protocol';
 import { childFor } from '../utils/logger.js';
 import { RATE_LIMIT_MAX_EVENTS, RATE_LIMIT_WINDOW_MS } from '../config/index.js';
@@ -77,11 +77,7 @@ export function resetErrorBudget(): void {
  * If the client passed an ack callback, the ack is always invoked — a client
  * that awaits a callback which never fires will hang its own UI forever.
  */
-export function on<A extends unknown[]>(
-  socket: Socket,
-  event: string,
-  handler: Handler<A>,
-): void {
+export function on<A extends unknown[]>(socket: Socket, event: string, handler: Handler<A>): void {
   socket.on(event, (...args: unknown[]) => {
     const log = childFor('socket', socket.id);
 
@@ -210,7 +206,10 @@ export class FatalError extends Error {}
  */
 export function installProcessGuards(options: {
   onFatal: (err: unknown) => void;
-  logger: { error: (obj: unknown, msg: string) => void; fatal: (obj: unknown, msg: string) => void };
+  logger: {
+    error: (obj: unknown, msg: string) => void;
+    fatal: (obj: unknown, msg: string) => void;
+  };
   counters: { uncaught: number; rejections: number };
 }): void {
   const { onFatal, logger: log, counters } = options;
@@ -222,7 +221,10 @@ export function installProcessGuards(options: {
       onFatal(err);
       return;
     }
-    log.error({ err, origin, total: counters.uncaught }, 'uncaught exception contained — server still serving');
+    log.error(
+      { err, origin, total: counters.uncaught },
+      'uncaught exception contained — server still serving',
+    );
   });
 
   process.on('unhandledRejection', (reason) => {
@@ -232,35 +234,9 @@ export function installProcessGuards(options: {
       onFatal(reason);
       return;
     }
-    log.error({ err: reason, total: counters.rejections }, 'unhandled rejection contained — server still serving');
+    log.error(
+      { err: reason, total: counters.rejections },
+      'unhandled rejection contained — server still serving',
+    );
   });
-}
-
-/** Builds a Socket.IO server with the hardening options applied. */
-export function createSocketServer(httpServer: import('node:http').Server, options: {
-  cors: { origin: string[]; methods: string[]; credentials: boolean };
-  maxHttpBufferSize: number;
-  pingInterval: number;
-  pingTimeout: number;
-}): Server {
-  // Imported lazily to keep this module dependency-light and testable.
-  const { Server: IOServer } = require('socket.io') as typeof import('socket.io');
-  return new IOServer(httpServer, {
-    cors: options.cors,
-    serveClient: false,
-    // Bounds the damage from a hostile or buggy client sending one enormous
-    // frame. The old default allowed 1 MB per packet of pure attacker text.
-    maxHttpBufferSize: options.maxHttpBufferSize,
-    pingInterval: options.pingInterval,
-    pingTimeout: options.pingTimeout,
-    // Lets a client that briefly drops off the network resume its socket id
-    // instead of starting a brand new flight. Matters a lot on mobile.
-    connectionStateRecovery: {
-      maxDisconnectionDuration: 2 * 60 * 1000,
-      skipMiddlewares: false,
-    },
-    // Reject oversized frames before they are buffered, not after.
-    perMessageDeflate: false,
-    transports: undefined,
-  } as never);
 }

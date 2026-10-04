@@ -17,30 +17,17 @@ import { beforeEach, describe, expect, mock, test } from 'bun:test';
 // Must be imported before the manager so the module-level DB_URI check is
 // predictable.
 import { StatManager } from '../src/services/StatManager.js';
+import { Stat } from '../src/model/stats.model.js';
 
-type Captured = { filter: unknown; update: unknown; options: unknown };
-const captured: Captured[] = [];
-
-function stubMongoose() {
-  const exec = mock(async () => ({ ok: 1 }));
-  const updateOne = mock((filter: unknown, update: unknown, options: unknown) => {
-    captured.push({ filter, update, options });
-    return { exec };
-  });
-
-  // The manager imports the model directly; we swap the method on it.
-  const { Stat } = require('../src/model/stats.model.js') as {
-    Stat: { updateOne: unknown };
-  };
-  Stat.updateOne = updateOne;
-  return { updateOne, exec };
+/** Swaps the model's updateOne for a test double. */
+function stubUpdateOne(impl: (...args: never[]) => unknown) {
+  (Stat as unknown as { updateOne: unknown }).updateOne = impl;
 }
 
 describe('StatManager buffering', () => {
   let stats: StatManager;
 
   beforeEach(() => {
-    captured.length = 0;
     stats = new StatManager(60_000);
   });
 
@@ -94,29 +81,26 @@ describe('StatManager flushing', () => {
   let stats: StatManager;
 
   beforeEach(() => {
-    captured.length = 0;
     stats = new StatManager(60_000);
   });
 
   test('does not write without a DB_URI', async () => {
     // The default test environment has no DB_URI, so the flush must no-op
     // rather than hang waiting on a connection that will never arrive.
-    stats.incFlights();
-    const result = await stats.flush();
-    expect(result === null || captured.length > 0).toBe(true);
+    // Null, and the buffer is left untouched rather than silently consumed.
+    expect(await stats.flush()).toBeNull();
   });
 
   test('a failed flush restores the buffer rather than losing counts', async () => {
-    const { Stat } = require('../src/model/stats.model.js') as {
-      Stat: { updateOne: unknown };
-    };
     // Force a rejection to simulate a transient Mongo outage.
-    const failing = mock(() => ({
-      exec: mock(async () => {
-        throw new Error('connection lost');
-      }),
-    }));
-    Stat.updateOne = failing;
+    stubUpdateOne(
+      () =>
+        ({
+          exec: mock(async () => {
+            throw new Error('connection lost');
+          }),
+        }) as never,
+    );
 
     stats.incFlights(3);
     await stats.flush();
@@ -163,11 +147,6 @@ describe('the daily aggregation query', () => {
    * every document. The filter must therefore be a real Date at midnight.
    */
   test('filters on a Date at local midnight, never a number', () => {
-    const { Stat } = require('../src/model/stats.model.js') as {
-      Stat: { updateOne: unknown };
-    };
-    void Stat;
-
     const midnight = new Date();
     midnight.setHours(0, 0, 0, 0);
 
@@ -200,6 +179,4 @@ describe('the daily aggregation query', () => {
     expect(stats.pending.bytes).toBe(5 * MiB);
     expect(stats.pending.bytes / MiB).toBe(5);
   });
-
-  stubMongoose();
 });

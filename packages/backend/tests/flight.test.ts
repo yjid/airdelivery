@@ -376,15 +376,27 @@ describe('nearby discovery', () => {
 
   test('two devices on the same hotspot subnet see each other', () => {
     const users = new UserManager();
-    users.add('a', { ...UserManager.fromAddress('a', 'A', classifyAddress('192.168.43.1')), name: 'A' });
-    users.add('b', { ...UserManager.fromAddress('b', 'B', classifyAddress('192.168.43.77')), name: 'B' });
+    users.add('a', {
+      ...UserManager.fromAddress('a', 'A', classifyAddress('192.168.43.1')),
+      name: 'A',
+    });
+    users.add('b', {
+      ...UserManager.fromAddress('b', 'B', classifyAddress('192.168.43.77')),
+      name: 'B',
+    });
     expect(users.nearby('a').map((u) => u.id)).toEqual(['b']);
   });
 
   test('two devices behind CGNAT see each other', () => {
     const users = new UserManager();
-    users.add('a', { ...UserManager.fromAddress('a', 'A', classifyAddress('100.64.0.1')), name: 'A' });
-    users.add('b', { ...UserManager.fromAddress('b', 'B', classifyAddress('100.64.0.2')), name: 'B' });
+    users.add('a', {
+      ...UserManager.fromAddress('a', 'A', classifyAddress('100.64.0.1')),
+      name: 'A',
+    });
+    users.add('b', {
+      ...UserManager.fromAddress('b', 'B', classifyAddress('100.64.0.2')),
+      name: 'B',
+    });
     expect(users.nearby('a')).toHaveLength(1);
   });
 

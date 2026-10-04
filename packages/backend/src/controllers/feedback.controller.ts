@@ -46,7 +46,9 @@ export async function submitFeedback(req: Request, res: Response): Promise<Respo
   // Idempotency: a double-tapped submit button should not create two rows.
   const idempotencyKey = req.get('Idempotency-Key');
   if (idempotencyKey) {
-    const existing = await Feedback.findOne({ idempotencyKey }).lean().catch(() => null);
+    const existing = await Feedback.findOne({ idempotencyKey })
+      .lean()
+      .catch(() => null);
     if (existing) {
       return res.status(200).json({ ok: true, message: 'Thanks! We already have that one.' });
     }

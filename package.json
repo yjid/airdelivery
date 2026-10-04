@@ -21,7 +21,7 @@
     "docker:up": "docker compose up -d --build",
     "docker:logs": "docker compose logs -f signal",
     "docker:down": "docker compose down",
-    "typecheck": "bun run --filter \"@airdelivery/protocol\" typecheck"
+    "typecheck": "bun run --filter \"@airdelivery/backend\" typecheck && bun run --filter \"@airdelivery/protocol\" typecheck"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

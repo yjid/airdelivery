@@ -20,5 +20,4 @@ const statSchema = new mongoose.Schema(
   { versionKey: false, minimize: false },
 );
 
-export const Stat =
-  mongoose.models.Stat ?? mongoose.model('Stat', statSchema);
+export const Stat = mongoose.models.Stat ?? mongoose.model('Stat', statSchema);

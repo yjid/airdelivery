@@ -69,10 +69,7 @@ const EnvSchema = z.object({
    */
   TRUST_PROXY: boolish(false),
 
-  STUN_URLS: csv([
-    'stun:stun.l.google.com:19302',
-    'stun:stun1.l.google.com:19302',
-  ]),
+  STUN_URLS: csv(['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302']),
 
   /** Fully env-driven TURN. No default — see .env.example. */
   TURN_URLS: csv([]),
@@ -104,8 +101,9 @@ if (!parsed.success) {
   const issues = parsed.error.issues
     .map((i) => `  ${i.path.join('.') || '(root)'}: ${i.message}`)
     .join('\n');
-  // eslint-disable-next-line no-console
-  console.error(`Invalid environment configuration:\n${issues}\n\nCopy .env.example to .env and fill it in.`);
+  console.error(
+    `Invalid environment configuration:\n${issues}\n\nCopy .env.example to .env and fill it in.`,
+  );
   process.exit(1);
 }
 

@@ -224,9 +224,9 @@ describe('resolveClientAddress — proxy trust', () => {
   });
 
   test('takes the right-most x-forwarded-for entry', () => {
-    expect(
-      resolveClientAddress({ 'x-forwarded-for': '1.1.1.1, 2.2.2.2' }, '10.0.0.1', true),
-    ).toBe('2.2.2.2');
+    expect(resolveClientAddress({ 'x-forwarded-for': '1.1.1.1, 2.2.2.2' }, '10.0.0.1', true)).toBe(
+      '2.2.2.2',
+    );
   });
 
   test('handles an array-valued header', () => {
