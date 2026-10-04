@@ -17,7 +17,6 @@
     "@vercel/analytics": "^1.5.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "idb-keyval": "^6.2.2",
     "lucide-react": "^0.515.0",
     "lz4js": "^0.2.0",
     "next": "^16.2.4",

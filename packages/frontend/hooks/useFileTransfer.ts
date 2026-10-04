@@ -54,7 +54,6 @@ import { yieldToEventLoop } from '@/lib/transfer/yield';
 import { NATIVE_HASH_LIMIT_BYTES, Sha256, hashBlob } from '@/lib/transfer/hash';
 import { createSink, describeStrategy, type Sink, type StorageKind } from '@/lib/storage/sink';
 import { collectFiles } from '@/utils/flattenFilelist';
-import { addToHistory } from '@/lib/history';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -430,13 +429,6 @@ export function useFileTransfer(options: {
         ),
       );
       onStats(1, file.size);
-      void addToHistory({
-        id: item.transferId,
-        name: item.directoryPath,
-        size: file.size,
-        type: 'send',
-        status: 'done',
-      });
     },
     [chunkSize, dataChannel, onStats, sendControl, waitForDrain],
   );
@@ -452,13 +444,6 @@ export function useFileTransfer(options: {
           r.transferId === record.transferId ? { ...r, status: 'error', error: message } : r,
         ),
       );
-      void addToHistory({
-        id: record.transferId,
-        name: record.path,
-        size: record.size,
-        type: 'receive',
-        status: 'error',
-      });
       sendControl({ type: 'reject', session: record.session, reason: message });
     },
     [sendControl],
@@ -516,14 +501,6 @@ export function useFileTransfer(options: {
             : r,
         ),
       );
-
-      void addToHistory({
-        id: record.transferId,
-        name: record.path,
-        size: record.size,
-        type: 'receive',
-        status: 'done',
-      });
     },
     [failIncoming],
   );
@@ -795,13 +772,6 @@ export function useFileTransfer(options: {
             t.transferId === next.transferId ? { ...t, status: 'error', error: message } : t,
           ),
         );
-        void addToHistory({
-          id: next.transferId,
-          name: next.directoryPath,
-          size: next.file.size,
-          type: 'send',
-          status: 'error',
-        });
       })
       .finally(() => {
         running.current.delete(next.transferId);
