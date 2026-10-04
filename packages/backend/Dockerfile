@@ -32,8 +32,13 @@ COPY tsconfig.base.json ./
 COPY packages/protocol packages/protocol
 COPY packages/backend packages/backend
 
-RUN bun build --target=bun --minify --sourcemap=external \
-      --outfile=/out/server.js packages/backend/src/server.ts
+# --outdir rather than --outfile: with an absolute --outfile this Bun build
+# prints a successful summary and leaves the directory empty, so the COPY below
+# fails with a misleading "file does not exist" that points at the COPY rather
+# than at the build. --sourcemap=external has the same requirement, and would
+# otherwise have shipped a bundle with the source map silently dropped.
+RUN bun build --target=bun --minify \
+      --outdir=/out packages/backend/src/server.ts
 
 # ---------------------------------------------------------------------------
 # runtime — minimal, non-root, with a real healthcheck.
@@ -48,7 +53,6 @@ RUN apk add --no-cache curl \
 
 COPY --from=deps  /app/node_modules      ./node_modules
 COPY --from=build /out/server.js        ./server.js
-COPY --from=build /out/server.js.map    ./server.js.map
 COPY --from=build /app/package.json     ./package.json
 
 ENV NODE_ENV=production \
@@ -70,4 +74,7 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
 # container is SIGKILLed after the grace period and every live transfer is cut.
 STOPSIGNAL SIGTERM
 
-CMD ["bun", "run", "server.js"]
+# `bun run <file>` resolves against package.json scripts before the
+# filesystem, so with no such script the container exits immediately with
+# "Module not found". An explicit relative path runs the file.
+CMD ["bun", "./server.js"]
