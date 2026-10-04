@@ -1,0 +1,65 @@
+# AirDelivery — signaling server + MongoDB.
+#
+#   docker compose up -d --build     start
+#   docker compose logs -f signal    follow logs
+#   docker compose down              stop
+#
+# The signaling server works without Mongo. Analytics and feedback need it, so
+# Mongo is included here by default but the server tolerates its absence.
+
+name: airdelivery
+
+services:
+  signal:
+    build:
+      context: .
+      dockerfile: packages/backend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - '5500:5500'
+    environment:
+      NODE_ENV: production
+      PORT: '5500'
+      LOG_LEVEL: info
+      TRUST_PROXY_HOPS: '1'
+      # Paste your relay details here, or in a .env file next to this one.
+      # Without TURN, campus and corporate networks cannot connect.
+      # See .env.example.
+      TURN_URLS: ${TURN_URLS:-}
+      TURN_USERNAME: ${TURN_USERNAME:-}
+      TURN_CREDENTIAL: ${TURN_CREDENTIAL:-}
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:5500/api/v1/health']
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    # Must exceed SHUTDOWN_TIMEOUT_MS so our bounded, graceful shutdown finishes
+    # before Docker escalates to SIGKILL.
+    stop_grace_period: 20s
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks: [airdelivery]
+
+  mongo:
+    image: mongo:8
+    restart: unless-stopped
+    command: ['--quiet']
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [airdelivery]
+    # Not published. If you need to inspect it, forward a port deliberately.
+
+volumes:
+  mongo-data:
+
+networks:
+  airdelivery:
+    driver: bridge

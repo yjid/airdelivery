@@ -1,17 +1,12 @@
 {
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
-    "target": "ESNext",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "baseUrl": ".",
-    "paths": {
-      "frontend/*": ["packages/frontend/src/*"],
-      "backend/*": ["packages/backend/src/*"]
-    }
+    "noEmit": true
   },
-  "exclude": ["node_modules", "dist"]
+  "files": [],
+  "references": [
+    { "path": "./packages/protocol" },
+    { "path": "./packages/backend" },
+    { "path": "./packages/frontend" }
+  ]
 }
