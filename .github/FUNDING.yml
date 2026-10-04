@@ -1,0 +1,8 @@
+# TURN relays are the only real operating cost of running this for others, and
+# without one, users on campus and office networks cannot connect at all.
+# uncomment and point at whatever platform you use.
+#
+# github: [your-user]
+# open_collective: airdelivery
+# patreon: airdelivery
+# ko_fi: airdelivery

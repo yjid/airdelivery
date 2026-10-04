@@ -1,0 +1,45 @@
+name: Connection help
+description: Two devices will not connect
+labels: [networking, needs-triage]
+body:
+  - type: dropdown
+    id: network
+    attributes:
+      label: Which network are both devices on?
+      options:
+        - Home Wi-Fi
+        - Mobile hotspot
+        - Campus / university Wi-Fi
+        - Office / corporate network
+        - Different networks entirely
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: behaviour
+    attributes:
+      label: What happens?
+      options:
+        - Stuck on "waiting for someone to join"
+        - Stuck on "establishing a direct connection"
+        - Connects then disconnects
+        - Connects, then transfers stall
+    validations:
+      required: true
+
+  - type: textarea
+    id: selfhosted
+    attributes:
+      label: Are you running your own server?
+      description: If so, is a TURN relay configured? STUN alone cannot traverse
+        symmetric NAT, which is why campus and office networks often fail.
+    validations:
+      required: true
+
+  - type: textarea
+    id: states
+    attributes:
+      label: Connection states
+      description: From chrome://webrtc-internals on both devices, the
+        (connectionState, iceConnectionState) pairs.

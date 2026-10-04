@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or discussion
+    url: https://github.com/GochiStuff/airdelivery/discussions
+    about: Ask before opening an issue — it may already be answered or planned.
+  - name: Security vulnerability
+    url: https://github.com/GochiStuff/airdelivery/security/advisories/new
+    about: Report privately. Do not open a public issue.
+  - name: How it works
+    url: https://airdelivery.site/guide/p2p-file-sharing
+    about: Background on WebRTC, STUN and TURN.
