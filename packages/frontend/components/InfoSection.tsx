@@ -215,7 +215,6 @@ const InfoSection = () => {
           </div>
         </div>
       </section>
-
     </main>
   );
 };
