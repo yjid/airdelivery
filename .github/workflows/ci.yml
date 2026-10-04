@@ -85,6 +85,12 @@ jobs:
       - name: Typecheck backend in isolation
         run: bun run --filter @airdelivery/backend typecheck
 
+      # buildx has to be provisioned explicitly. Without this the action falls
+      # back to the plain `docker` driver, which cannot export a cache — the
+      # build fails with "Cache export is not supported for the docker driver"
+      # rather than with anything about the image.
+      - uses: docker/setup-buildx-action@v3
+
       - name: Build the signaling server image
         uses: docker/build-push-action@v6
         with:
