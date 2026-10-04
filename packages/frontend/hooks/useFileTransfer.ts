@@ -103,7 +103,9 @@ export function useFileTransfer(
       channel.send(data as any);
     } catch (err: any) {
       if (err.name === 'InvalidStateError' || err.name === 'NetworkError') {
-        throw new Error('Connection closed');
+        // Preserve the original: a bare Error discarded the stack that
+        // explains what actually failed.
+        throw new Error('Connection closed', { cause: err });
       }
       throw err;
     }
@@ -273,15 +275,57 @@ export function useFileTransfer(
 
   const COMPRESSED_EXTS = new Set([
     // archives
-    'zip', 'rar', '7z', 'gz', 'tgz', 'bz2', 'xz', 'zst', 'tar', 'iso', 'dmg', 'apk',
+    'zip',
+    'rar',
+    '7z',
+    'gz',
+    'tgz',
+    'bz2',
+    'xz',
+    'zst',
+    'tar',
+    'iso',
+    'dmg',
+    'apk',
     // video
-    'mp4', 'mkv', 'mov', 'avi', 'webm', 'm4v', 'mpg', 'mpeg', 'wmv', 'flv', 'ts',
+    'mp4',
+    'mkv',
+    'mov',
+    'avi',
+    'webm',
+    'm4v',
+    'mpg',
+    'mpeg',
+    'wmv',
+    'flv',
+    'ts',
     // images
-    'jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif', 'avif', 'tiff',
+    'jpg',
+    'jpeg',
+    'png',
+    'webp',
+    'gif',
+    'heic',
+    'heif',
+    'avif',
+    'tiff',
     // audio
-    'mp3', 'wav', 'flac', 'ogg', 'opus', 'm4a', 'aac', 'wma',
+    'mp3',
+    'wav',
+    'flac',
+    'ogg',
+    'opus',
+    'm4a',
+    'aac',
+    'wma',
     // documents that are zip containers internally
-    'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub',
+    'docx',
+    'xlsx',
+    'pptx',
+    'odt',
+    'ods',
+    'odp',
+    'epub',
     // other already-compressed
     'pdf',
   ]);
@@ -451,7 +495,7 @@ export function useFileTransfer(
       setQueue((q) =>
         q.map((x) => (x.transferId === transferId ? { ...x, progress: 100, status: 'done' } : x)),
       );
-      
+
       // Stats update (persistent)
       updateStats(1, total);
 
@@ -509,7 +553,7 @@ export function useFileTransfer(
           if (!rec.writer) return;
           await rec.writer.write(new Uint8Array(chunk));
           rec.received += chunk.byteLength;
-          
+
           // Metrics tracking (real-time via refs)
           totalReceivedRef.current += chunk.byteLength;
           receiveThroughputAccumulator.current += chunk.byteLength;
@@ -828,7 +872,7 @@ export function useFileTransfer(
 
     incoming.current = {};
     setRecvQueue([]);
-    
+
     totalSentRef.current = 0;
     totalReceivedRef.current = 0;
     sendThroughputAccumulator.current = 0;

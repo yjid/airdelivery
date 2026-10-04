@@ -19,7 +19,6 @@ export default function MainPage() {
   // Modal for showing terms
   const [showTerms, setShowTerms] = useState(false);
 
-
   // Drag-over visual state for nearby user tiles
   const [dragOverId, setDragOverId] = useState<string | null>(null);
 
