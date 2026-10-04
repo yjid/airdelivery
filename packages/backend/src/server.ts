@@ -1,262 +1,199 @@
-import express from 'express';
-import http from 'http';
-import { Server } from 'socket.io';
-import cors from 'cors';
-import { z } from 'zod';
-import mongoose from 'mongoose';
+/**
+ * Server entrypoint.
+ *
+ * The crash story, in one file.
+ *
+ * The old version had no `uncaughtException` and no `unhandledRejection`
+ * handler. In Node and Bun the default for both is to terminate the process.
+ * Socket.IO does not catch exceptions thrown from listeners, so any throw in a
+ * handler — including a `TypeError` from destructuring a missing argument — was
+ * a full server restart. That is what "the backend crashes a lot" was.
+ *
+ * The old shutdown was also unbounded: `server.close()` waits for every open
+ * socket, WebSocket connections never end on their own, and there was no
+ * deadline. Any deploy that sent SIGTERM hung until the platform SIGKILLed the
+ * process — which, on a rolling deploy, means a hard cut for every transfer in
+ * flight.
+ */
 
-import Peer from './peer.js';
-import { connectDB } from './db/mongodb.js';
-import { generateCode } from './utils/code.js';
-import feedbackRoute from './routes/feedback.route.js';
-import { getRandomName } from './utils/names.js';
-import { NODE_ENV, PORT } from './config/index.js';
-import logger from './utils/logger.js';
-
-// Services
-import { UserManager } from './services/UserManager.js';
+import { createServer, type Server as HttpServer } from 'node:http';
+import { Server as IOServer } from 'socket.io';
+import { createApp } from './app.js';
 import { FlightManager } from './services/FlightManager.js';
+import { UserManager } from './services/UserManager.js';
 import { StatManager } from './services/StatManager.js';
+import { registerSocketHandlers } from './socket/handlers.js';
+import { FatalError, installProcessGuards } from './socket/guard.js';
+import { connectDB, disconnectDB, scheduleReconnect } from './db/mongodb.js';
+import {
+  CORS_ORIGIN,
+  PORT,
+  SHUTDOWN_TIMEOUT_MS,
+  SOCKET_MAX_BUFFER_BYTES,
+  SOCKET_PING_INTERVAL_MS,
+  SOCKET_PING_TIMEOUT_MS,
+  SOCKET_TRANSPORTS,
+} from './config/index.js';
+import { logger } from './utils/logger.js';
 
-const logContext = 'Server';
-const app = express();
-const server = http.createServer(app);
+// ---------------------------------------------------------------------------
+// Process guards — installed before anything that can throw.
+// ---------------------------------------------------------------------------
 
-// Initialize Services
-const userManager = new UserManager();
-const flightManager = new FlightManager(userManager);
-const statManager = new StatManager();
+const counters = { uncaught: 0, rejections: 0 };
+let shuttingDown = false;
 
-// Middleware
-app.use(express.json());
-app.use(
-  cors({
-    origin: [
-      'https://airdelivery.site',
-      'https://api.airdelivery.site',
-      'http://localhost:3000',
-      'http://localhost:3001',
-    ],
-    methods: ['GET', 'POST'],
-    credentials: true,
-  }),
-);
-
-// Routes
-app.use('/api/v1/feedback', feedbackRoute);
-app.get('/api/v1/health', (req, res) => {
-  logger.debug(logContext, 'Health check request received');
-  res.status(200).send('OK');
+installProcessGuards({
+  onFatal: () => void shutdown('fatal-error'),
+  logger,
+  counters,
 });
 
-// Socket.io Setup
-const io = new Server(server, {
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+const app = createApp();
+const httpServer = createServer(app);
+
+const users = new UserManager();
+const flights = new FlightManager(users);
+const stats = new StatManager();
+
+const io = new IOServer(httpServer, {
   cors: {
-    origin: [
-      'https://airdelivery.site',
-      'https://api.airdelivery.site',
-      'http://localhost:3000',
-      '',
-    ],
+    origin: CORS_ORIGIN,
     methods: ['GET', 'POST'],
     credentials: true,
   },
+  serveClient: false,
+  maxHttpBufferSize: SOCKET_MAX_BUFFER_BYTES,
+  pingInterval: SOCKET_PING_INTERVAL_MS,
+  pingTimeout: SOCKET_PING_TIMEOUT_MS,
+  connectionStateRecovery: {
+    // A phone that drops off Wi-Fi for 30 seconds and comes back keeps its
+    // socket id, and therefore its flight, instead of starting over.
+    maxDisconnectionDuration: 2 * 60 * 1000,
+  },
+  perMessageDeflate: false,
+  /**
+   * Transport order matters enormously for reach.
+   *
+   * Forcing `['websocket']` only — as the client previously did — means any
+   * network that strips or breaks the WebSocket upgrade (a large share of
+   * corporate proxies and campus networks) cannot connect at all. The default
+   * `['polling', 'websocket']` lets those clients establish a connection over
+   * plain HTTP and then upgrade.
+   */
+  transports: SOCKET_TRANSPORTS,
+  allowUpgrades: true,
 });
 
-// Validation Schemas
-const UpdateStatsSchema = z.object({
-  filesShared: z.number().optional(),
-  Transferred: z.number().optional(),
-});
+registerSocketHandlers(io, { io, flights, users, stats });
 
-const InviteSchema = z.object({
-  targetId: z.string(),
-  flightCode: z.string(),
-});
+flights.startSweeper();
+stats.start();
 
-// -------------------------------------------------
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
 
-function broadcastUsers(flightCode: string) {
-  const flight = flightManager.getFlight(flightCode);
-  if (!flight) return;
+/**
+ * A failure to bind is genuinely fatal: there is nothing to serve. Everything
+ * else is contained.
+ */
+export class StartupError extends FatalError {}
 
-  const members = flightManager.getMembers(flightCode);
+async function start(): Promise<void> {
+  // Deliberately not awaited. The signaling server does not depend on Mongo,
+  // and a database outage must not stop file transfers from working.
+  void connectDB();
+  const stopReconnect = scheduleReconnect();
 
-  io.to(flightCode).emit('flightUsers', {
-    ownerId: flight.ownerId,
-    members: members,
-    ownerConnected: flight.ownerConnected,
-  });
-}
-
-io.on('connection', (socket) => {
-  const logId = `Socket[${socket.id}]`;
-  logger.debug(logId, 'New socket connected');
-
-  const name = getRandomName();
-  const peer = new Peer(socket, socket.request, { debug: NODE_ENV === 'development' });
-
-  userManager.addUser(socket.id, {
-    id: socket.id,
-    name,
-    ipPrefix: peer.ipPrefix,
-    isPrivate: peer.isPrivate,
-    ip: peer.ip,
-    inFlight: false,
-  });
-
-  socket.emit('yourName', { id: socket.id, name });
-
-  socket.on('createFlight', (callback) => {
-    let code;
-    do {
-      code = generateCode();
-    } while (flightManager.hasFlight(code));
-
-    flightManager.createFlight(code, socket.id);
-    statManager.incFlights();
-
-    socket.join(code);
-    callback({ code });
-    broadcastUsers(code);
-  });
-
-  socket.on('updateStats', (data) => {
-    const result = UpdateStatsSchema.safeParse(data);
-    if (!result.success) return;
-    logger.debug(logId, 'Metadata received', result.data);
-    statManager.incStats(result.data.filesShared || 0, result.data.Transferred || 0);
-  });
-
-  socket.on('requestToConnect', (targetId, callback) => {
-    logger.debug(logId, 'Event: requestToConnect', { targetId });
-    if (!io.sockets.sockets.has(targetId)) {
-      return callback({ success: false, message: 'User not found or offline' });
-    }
-
-    let code;
-    do {
-      code = generateCode();
-    } while (flightManager.hasFlight(code));
-
-    flightManager.createFlight(code, socket.id);
-    flightManager.joinFlight(code, targetId);
-
-    socket.join(code);
-    io.to(targetId).socketsJoin(code);
-
-    const sender = userManager.getUser(socket.id);
-    const receiver = userManager.getUser(targetId);
-
-    io.to(code).emit('flightStarted', {
-      code,
-      members: [
-        { id: socket.id, name: sender?.name || `Peer-${socket.id.slice(0, 4)}` },
-        { id: targetId, name: receiver?.name || `Peer-${targetId.slice(0, 4)}` },
-      ],
-    });
-
-    callback({ success: true, code });
-  });
-
-  socket.on('inviteToFlight', (data, callback) => {
-    const result = InviteSchema.safeParse(data);
-    if (!result.success) return callback?.({ success: false, message: 'Invalid payload' });
-
-    const { targetId, flightCode } = result.data;
-    const flight = flightManager.getFlight(flightCode);
-
-    if (!flight || !flight.members.includes(socket.id)) {
-      return callback?.({ success: false, message: 'Flight not found or access denied' });
-    }
-
-    const inviter = userManager.getUser(socket.id);
-    io.to(targetId).emit('invitedToFlight', {
-      flightCode,
-      fromId: socket.id,
-      fromName: inviter?.name || 'Someone',
-    });
-    callback?.({ success: true });
-  });
-
-  socket.on('getNearbyUsers', () => {
-    const nearby = userManager.getNearbyUsers(socket.id);
-    socket.emit('nearbyUsers', nearby);
-  });
-
-  socket.on('joinFlight', (code, callback) => {
-    const result = flightManager.joinFlight(code, socket.id);
-    if (!result.success) return callback(result);
-
-    socket.join(code);
-    const flight = flightManager.getFlight(code);
-    if (flight && flight.ownerId !== socket.id) {
-      socket.emit('offer', flight.ownerId, { sdp: flight.sdp });
-    }
-
-    callback({ success: true });
-    broadcastUsers(code);
-  });
-
-  socket.on('offer', (code, sdp) => {
-    logger.debug(logId, 'Event: offer', { code });
-    const flight = flightManager.getFlight(code);
-    if (flight) flight.sdp = sdp;
-  });
-
-  socket.on('answer', (code, { sdp }) => {
-    logger.debug(logId, 'Event: answer', { code });
-    const flight = flightManager.getFlight(code);
-    if (flight && io.sockets.sockets.has(flight.ownerId)) {
-      io.to(flight.ownerId).emit('answer', { id: socket.id, sdp });
-    }
-  });
-
-  socket.on('ice-candidate', (payload) => {
-    logger.debug(logId, 'Event: ice-candidate', { to: payload?.id });
-    if (payload?.id && payload?.candidate) {
-      io.to(payload.id).emit('ice-candidate', { id: socket.id, candidate: payload.candidate });
-    }
-  });
-
-  socket.on('leaveFlight', () => {
-    const affectedCodes = flightManager.leaveFlight(socket.id);
-    affectedCodes.forEach((code) => {
-      if (!flightManager.hasFlight(code)) {
-        io.to(code).emit('flightDeleted');
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        reject(new StartupError(`port ${PORT} is already in use`));
       } else {
-        broadcastUsers(code);
+        reject(new StartupError(err.message));
       }
+    };
+    httpServer.once('error', onError);
+    httpServer.listen(PORT, () => {
+      httpServer.off('error', onError);
+      resolve();
     });
   });
 
-  socket.on('disconnect', () => {
-    const affectedCodes = flightManager.leaveFlight(socket.id);
-    affectedCodes.forEach((code) => broadcastUsers(code));
-    userManager.removeUser(socket.id);
-    logger.debug(logId, 'Socket disconnected');
-  });
-});
+  stopReconnect();
+  logger.info(
+    { port: PORT, transports: SOCKET_TRANSPORTS, cors: CORS_ORIGIN },
+    'signaling server listening',
+  );
+}
 
-async function shutdown() {
-  logger.info(logContext, 'Shutting down gracefully...');
-  await statManager.flush();
-  if (mongoose.connection.readyState !== 0) {
-    await mongoose.connection.close();
-  }
-  server.close(() => {
-    logger.info(logContext, 'Server closed.');
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
+/**
+ * Bounded, ordered shutdown.
+ *
+ *   1. stop accepting new work
+ *   2. tell clients why, so their UI can explain instead of hanging
+ *   3. flush stats while the DB is still reachable
+ *   4. force every socket closed at a hard deadline
+ *   5. only then exit
+ */
+export async function shutdown(reason = 'signal'): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  logger.info({ reason, uncaught: counters.uncaught, rejections: counters.rejections }, 'shutting down');
+
+  const force = setTimeout(() => {
+    logger.warn('shutdown deadline exceeded — forcing exit');
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  force.unref();
+
+  try {
+    // 1 + 2. Give every peer an explicit reason. Without this a deploy looks
+    // exactly like a network failure to the other side.
+    io.emit('flightDeleted', 'server-shutdown');
+    io.disconnectSockets(true);
+
+    // 3. Best effort, bounded.
+    await Promise.race([stats.stop(), new Promise((r) => setTimeout(r, 2_000))]);
+
+    flights.stopSweeper();
+
+    await new Promise<void>((resolve) => {
+      httpServer.close(() => resolve());
+      // Without this, `close` waits forever on any socket that never ends —
+      // which is every WebSocket. This was the original hang.
+      httpServer.closeAllConnections?.();
+    });
+
+    io.close();
+    await disconnectDB();
+
+    clearTimeout(force);
+    logger.info('shutdown complete');
     process.exit(0);
-  });
+  } catch (err) {
+    logger.error({ err }, 'error during shutdown');
+    clearTimeout(force);
+    process.exit(1);
+  }
 }
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 
-if (process.env.DB_URI) {
-  connectDB();
-}
-
-server.listen(PORT, () => {
-  logger.info(logContext, `Server running on port ${PORT}`);
+start().catch((err) => {
+  logger.fatal({ err }, 'failed to start');
+  process.exit(1);
 });
+
+export { httpServer, io, flights, users, stats };

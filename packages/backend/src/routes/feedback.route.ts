@@ -1,10 +1,8 @@
-import express from 'express';
+import { Router } from 'express';
 import { submitFeedback } from '../controllers/feedback.controller.js';
-import { feedbackRateLimiter } from '../middleware/rl/feedback.ratelimit.js';
 
-// don't ask me why not store the feedback using websocket . IDK
-const feedbackRoute = express.Router();
+const feedbackRoute = Router();
 
-feedbackRoute.post('/', feedbackRateLimiter, submitFeedback);
+feedbackRoute.post('/', submitFeedback);
 
 export default feedbackRoute;
