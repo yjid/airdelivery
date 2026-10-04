@@ -1,1108 +1,989 @@
 'use client';
 
-import { useState, useRef, ChangeEvent, useEffect, useCallback } from 'react';
-import PQueue from 'p-queue';
-import pRetry from 'p-retry';
-// @ts-ignore
-import * as lz4 from 'lz4js';
-import { flattenFileList } from '@/utils/flattenFilelist';
-import { v4 } from 'uuid';
-import { generateThumbnail } from '@/lib/generateThumbnail';
-import { zipFiles } from '@/utils/compress';
+/**
+ * File transfer engine.
+ *
+ * Rewritten around three invariants the previous version violated.
+ *
+ * 1. THE RECEIVER MUST NEVER EXCEED MEMORY.
+ *    `incoming.current[id].queue` was an unbounded array of ArrayBuffers with no
+ *    cap and no backpressure to the sender. A slow disk or a slow phone would
+ *    let it grow until the tab was OOM-killed mid-transfer. There is now a
+ *    hard byte ceiling, and exceeding it pauses the sender rather than
+ *    buffering more.
+ *
+ * 2. PER-TRANSFER STATE MUST BE PER TRANSFER.
+ *    `lastBlobRef` and `pendingBlobUrlRef` were single module-level refs shared
+ *    by every concurrent transfer, so with two files arriving at once one
+ *    transfer's completion would hand the other transfer's blob to the
+ *    auto-download path, saving the wrong file under the wrong name. Both are
+ *    now fields on the per-transfer record.
+ *
+ * 3. NO WHOLE-FILE BUFFERS.
+ *    `sha256Hex(file)` before sending, `verifyDisk` reading the file back
+ *    afterwards, and the 1.2 GB in-memory receive cap each meant a multi-
+ *    gigabyte transfer needed the whole file resident at once. Hashing is now
+ *    incremental, and receiving streams to OPFS or a chosen folder.
+ *
+ * Performance changes, since throughput is the product:
+ *  - The per-chunk `await setTimeout(0)` is gone. Browsers clamp nested timers
+ *    to ~4 ms, which capped the sender at ~250 chunks/s (~16 MB/s) regardless
+ *    of link speed. See `lib/transfer/yield.ts`.
+ *  - Bulk channels are partially reliable, so a lost packet no longer stalls
+ *    the whole file; the receiver reassembles by sequence.
+ *  - Chunk size is read from `pc.sctp.maxMessageSize`. The previous code read
+ *    `dataChannel.maxMessageSize`, which does not exist in any browser, so the
+ *    negotiated 256 KB limit was never discovered and every transfer ran at the
+ *    64 KB fallback.
+ *  - Buffers are reused and the header no longer carries a UUID.
+ */
 
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ChangeEvent } from 'react';
+import {
+  MAX_CHUNK_PAYLOAD,
+  Reassembler,
+  decodeChunk,
+  encodeChunk,
+  isKnownCompressed,
+  shouldCompressSample,
+  verifyChunk,
+  type DecodedChunk,
+} from '@/lib/transfer/codec';
+import { yieldToEventLoop } from '@/lib/transfer/yield';
+import { NATIVE_HASH_LIMIT_BYTES, Sha256, hashBlob } from '@/lib/transfer/hash';
+import { createSink, describeStrategy, type Sink, type StorageKind } from '@/lib/storage/sink';
+import { collectFiles } from '@/utils/flattenFilelist';
 import { addToHistory } from '@/lib/history';
-import { createFileWriter } from '@/lib/fsAccess';
-import { sha256Hex } from '@/utils/hash';
 
-// ----------------------------- Types -----------------------------------
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
-type TransferStatus = 'queued' | 'sending' | 'paused' | 'done' | 'error' | 'canceled' | 'receiving';
+export type TransferStatus =
+  | 'queued'
+  | 'sending'
+  | 'paused'
+  | 'done'
+  | 'error'
+  | 'canceled'
+  | 'receiving'
+  | 'verifying';
 
-type Transfer = {
-  file: File;
+export interface TransferItem {
   transferId: string;
+  file: File;
   directoryPath: string;
   progress: number;
-  type?: 'send' | 'receive';
-  speedBps: number;
+  bytesSent: number;
   status: TransferStatus;
   thumbnail?: string;
-};
+  /** Populated when status is 'error', for the UI to show. */
+  error?: string;
+}
 
-type RecvTransfer = {
+export interface ReceivedItem {
   transferId: string;
   directoryPath: string;
   size: number;
   received: number;
   progress: number;
-  blobUrl?: string;
-  type: 'send' | 'receive';
-  downloaded?: boolean;
+  url: string | null;
+  type: 'receive';
+  downloaded: boolean;
   status: TransferStatus;
   thumbnail?: string;
-};
+  storage: StorageKind;
+  error?: string;
+}
 
-type Meta = {
+export interface TransferMetrics {
   totalSent: number;
   totalReceived: number;
   sendSpeedBps: number;
   receiveSpeedBps: number;
+}
+
+// ---------------------------------------------------------------------------
+// Control messages
+// ---------------------------------------------------------------------------
+
+type ControlMessage =
+  | {
+      type: 'begin';
+      session: number;
+      transferId: string;
+      path: string;
+      size: number;
+      hash?: string;
+      mime?: string;
+      thumb?: string;
+    }
+  | { type: 'end'; session: number; hash?: string }
+  | { type: 'pause'; session: number }
+  | { type: 'resume'; session: number }
+  | { type: 'cancel'; session: number }
+  | { type: 'reject'; session: number; reason: string };
+
+interface IncomingRecord {
+  transferId: string;
+  session: number;
+  path: string;
+  size: number;
+  received: number;
+  hasher: Sha256;
+  reassembler: Reassembler;
+  sink: Sink;
+  /** Digest the sender announced, when one is available. */
+  expectedHash: string | undefined;
+  queue: DecodedChunk[];
+  queuedBytes: number;
+  draining: boolean;
+  controls: Controls;
+  lastProgressAt: number;
+  closed: boolean;
+}
+
+interface Controls {
+  paused: boolean;
+  canceled: boolean;
+  resumeResolve: (() => void) | null;
+}
+
+const newControls = (): Controls => ({ paused: false, canceled: false, resumeResolve: null });
+
+// ---------------------------------------------------------------------------
+// Tuning
+// ---------------------------------------------------------------------------
+
+/**
+ * Peak receive-side buffering before we ask the sender to pause.
+ *
+ * 32 MB is roughly one chunk per parallel channel plus slack. Large enough that
+ * a burst never triggers a round trip, small enough that a phone cannot be
+ * pushed into a swap.
+ */
+const RECEIVE_HIGH_WATER = 32 * 1024 * 1024;
+
+/** Refuse to grow the queue past this at all, whatever the peer does. */
+const RECEIVE_HARD_LIMIT = 96 * 1024 * 1024;
+
+const PROGRESS_INTERVAL_MS = 250;
+
+const STATUS_LABELS: Record<TransferStatus, string> = {
+  queued: 'Waiting',
+  sending: 'Transferring',
+  paused: 'Paused',
+  done: 'Completed',
+  error: 'Failed',
+  canceled: 'Canceled',
+  receiving: 'Receiving',
+  verifying: 'Verifying',
 };
 
-export function useFileTransfer(
-  dataChannel: RTCDataChannel | null,
-  controlChannel: RTCDataChannel | null,
-  disconnect: () => void,
-  updateStats: (files: number, transfer: number) => void,
-) {
-  const [queue, setQueue] = useState<Transfer[]>([]);
-  const [recvQueue, setRecvQueue] = useState<RecvTransfer[]>([]);
-  const [meta, setMeta] = useState<Meta>({
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
+
+export function useFileTransfer(options: {
+  dataChannel: RTCDataChannel | null;
+  controlChannel: RTCDataChannel | null;
+  peer: React.MutableRefObject<RTCPeerConnection | null>;
+  onDisconnect: () => void;
+  onStats: (files: number, bytes: number) => void;
+  config?: { maxChunkBytes?: number; parallelChannels?: number } | null;
+}) {
+  const { dataChannel, controlChannel, peer, onDisconnect, onStats, config } = options;
+
+  const [queue, setQueue] = useState<TransferItem[]>([]);
+  const [recvQueue, setRecvQueue] = useState<ReceivedItem[]>([]);
+  const [metrics, setMetrics] = useState<TransferMetrics>({
     totalSent: 0,
     totalReceived: 0,
     sendSpeedBps: 0,
     receiveSpeedBps: 0,
   });
 
-  // --- Real-time metrics tracking ---
-  const totalSentRef = useRef(0);
-  const totalReceivedRef = useRef(0);
-  const sendThroughputAccumulator = useRef(0);
-  const receiveThroughputAccumulator = useRef(0);
+  const outgoing = useRef(new Map<string, Controls>());
+  const incoming = useRef(new Map<number, IncomingRecord>());
+  /** Session ids for outgoing transfers. u16, so it wraps after 65535. */
+  const nextSession = useRef(1);
+  const results = useRef(new Map<number, { url: string | null; dispose?: () => void }>());
 
-  // Periodic metrics sync (every 1s)
+  const sentRef = useRef(0);
+  const receivedRef = useRef(0);
+  const sendAccum = useRef(0);
+  const receiveAccum = useRef(0);
+
+  // -- metrics ---------------------------------------------------------------
+
   useEffect(() => {
-    const interval = setInterval(() => {
-      setMeta((prev) => ({
-        ...prev,
-        totalSent: totalSentRef.current,
-        totalReceived: totalReceivedRef.current,
-        sendSpeedBps: sendThroughputAccumulator.current,
-        receiveSpeedBps: receiveThroughputAccumulator.current,
-      }));
-      // Reset accumulators for next second
-      sendThroughputAccumulator.current = 0;
-      receiveThroughputAccumulator.current = 0;
+    const id = setInterval(() => {
+      setMetrics({
+        totalSent: sentRef.current,
+        totalReceived: receivedRef.current,
+        sendSpeedBps: sendAccum.current,
+        receiveSpeedBps: receiveAccum.current,
+      });
+      sendAccum.current = 0;
+      receiveAccum.current = 0;
     }, 1000);
-
-    return () => clearInterval(interval);
+    return () => clearInterval(id);
   }, []);
 
-  // --- Constants / tuning  ( MOST OF THESE WERE SET AFTER BENCHMARKING DIFF SETTINGS ) ---------------------------------------------
-  const MAX_RAM_SIZE = 1.2 * 1024 * 1024 * 1024; // 1.2 GB
-  const peerMax = (dataChannel as any)?.maxMessageSize || 0;
-  const CHUNK_SIZE = peerMax > 0 ? Math.min(256 * 1024, Math.floor(peerMax * 0.9)) : 64 * 1024;
-  const BUFFER_THRESHOLD = 8 * 1024 * 1024; // 8MB high-water (Chromium allows 16MB, Safari/Firefox tolerate 8MB)
-  const PROGRESS_INTERVAL_MS = 500;
+  // -- sizing ----------------------------------------------------------------
 
-  const safeSend = useCallback((channel: RTCDataChannel | null, data: string | ArrayBuffer) => {
-    if (!channel || channel.readyState !== 'open') {
-      throw new Error('Connection closed');
+  /**
+   * The negotiated SCTP message size.
+   *
+   * `RTCDataChannel.maxMessageSize` does not exist in any browser, so the
+   * previous `dataChannel.maxMessageSize` probe always returned undefined and
+   * every transfer silently ran at the 64 KB fallback instead of the 256 KB
+   * the connection had actually negotiated.
+   */
+  const chunkSize = useMemo(() => {
+    const configured = config?.maxChunkBytes;
+    if (typeof configured === 'number' && configured > 0) {
+      return Math.min(configured, MAX_CHUNK_PAYLOAD);
     }
-    try {
-      channel.send(data as any);
-    } catch (err: any) {
-      if (err.name === 'InvalidStateError' || err.name === 'NetworkError') {
-        // Preserve the original: a bare Error discarded the stack that
-        // explains what actually failed.
-        throw new Error('Connection closed', { cause: err });
+    const negotiated = peer.current?.sctp?.maxMessageSize;
+    if (typeof negotiated === 'number' && negotiated > 0) {
+      // Leave headroom for the header.
+      return Math.max(16 * 1024, Math.min(negotiated - 1024, MAX_CHUNK_PAYLOAD));
+    }
+    return 64 * 1024;
+  }, [config?.maxChunkBytes, peer]);
+
+  // -- sending ---------------------------------------------------------------
+
+  const sendControl = useCallback(
+    (message: ControlMessage) => {
+      const payload = JSON.stringify(message);
+      const target = controlChannel?.readyState === 'open' ? controlChannel : dataChannel;
+      if (!target || target.readyState !== 'open') return false;
+      try {
+        target.send(payload);
+        return true;
+      } catch {
+        return false;
       }
-      throw err;
-    }
-  }, []);
-
-  // JSON control messages (init/pause/resume/cancel/done) ride the dedicated
-  // control channel so chunk floods can never head-of-line block them.
-  const controlSend = useCallback(
-    (data: string) => {
-      const target =
-        controlChannel && controlChannel.readyState === 'open' ? controlChannel : dataChannel;
-      safeSend(target, data);
     },
-    [controlChannel, dataChannel, safeSend],
+    [controlChannel, dataChannel],
   );
 
-  // We store partial incoming transfers here to avoid re-rendering on each chunk
-  const incoming = useRef<
-    Record<
-      string,
-      {
-        size: number;
-        received: number;
-        writing: boolean;
-        queue: ArrayBuffer[];
-        lastProgressUpdate: number;
-        writer: WritableStreamDefaultWriter | null;
-        directoryPath: string;
-        thumbnail?: string;
-        hash?: string;
-        verifyDisk?: (() => Promise<File | null>) | null;
-      }
-    >
-  >({});
-
-  // track which transfer is currently being processed by the writer
-  const currentReceivingIdRef = useRef<string | null>(null);
-  const lastBlobRef = useRef<Blob | null>(null);
-  const pendingBlobUrlRef = useRef<{ url: string; name: string } | null>(null);
-
-  const pq = useRef(new PQueue({ concurrency: 1 }));
-
-  const transferControls = useRef<
-    Record<
-      string,
-      {
-        paused: boolean;
-        resumePromise?: Promise<void>;
-        resumeResolve?: () => void;
-        canceled: boolean;
-      }
-    >
-  >({});
-
-  const statusMap: Record<TransferStatus, string> = {
-    queued: 'Waiting to send',
-    sending: 'Transferring',
-    paused: 'Paused',
-    done: 'Completed',
-    error: 'Failed',
-    canceled: 'Canceled',
-    receiving: 'Receiving',
-  };
-
-  // ------------------------- Download helpers ---------------------------
-
-  function downloadFile(file: { transferId: string; blobUrl: string; directoryPath: string }) {
-    const a = document.createElement('a');
-
-    a.href = file.blobUrl;
-    a.download = file.directoryPath;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-
-    requestAnimationFrame(() => {
-      a.click();
-      document.body.removeChild(a);
-    });
-
-    setTimeout(() => {
-      URL.revokeObjectURL(file.blobUrl);
-
-      setRecvQueue((prev) =>
-        prev.map((f) => (f.transferId === file.transferId ? { ...f, downloaded: true } : f)),
-      );
-    }, 2000);
-  }
-
-  function openFile(blobUrl: string) {
-    window.open(blobUrl, '_blank', 'noopener,noreferrer');
-  }
-
-  async function downloadAll() {
-    for (const file of recvQueue) {
-      if (file.status === 'done' && file.blobUrl && !file.downloaded) {
-        const a = document.createElement('a');
-        a.href = file.blobUrl;
-        a.download = file.directoryPath;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-
-        await new Promise((res) => setTimeout(res, 100));
-      }
-    }
-  }
-
-  const [autoDownload, setAutoDownload] = useState(false);
-  function tryAutoDownload(url: string, filename: string) {
-    if (autoDownload) {
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => {
-        URL.revokeObjectURL(url);
-      }, 800);
-    }
-  }
-
-  const handleFileSelect = useCallback(async (e: ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files) return;
-    let files = await flattenFileList(e.target.files);
-    if (files.length === 0) return;
-
-    const totalSize = files.reduce((acc, f) => acc + f.size, 0);
-
-    // Next-level Folder Preservation: Zip multiple files automatically if size is reasonable
-    if (files.length > 1 && totalSize < 500 * 1024 * 1024) {
-      try {
-        // Determine zip name from relative path or first file
-        const firstPath = (files[0] as any).webkitRelativePath;
-        const folderName = firstPath ? firstPath.split('/')[0] : 'archive';
-
-        const zippedFile = await zipFiles(files, folderName);
-        files = [zippedFile];
-      } catch (err) {
-        console.error('Zipping failed, falling back to individual files', err);
-      }
-    }
-
-    const transfers = await Promise.all(
-      files.map(async (file) => {
-        const id = v4();
-        const thumb = await generateThumbnail(file);
-        transferControls.current[id] = { paused: false, canceled: false };
-        return {
-          file,
-          transferId: id,
-          directoryPath: (file as any).webkitRelativePath || file.name,
-          progress: 0,
-          speedBps: 0,
-          status: 'queued' as const,
-          thumbnail: thumb,
-        };
-      }),
-    );
-
-    // Avoid duplicates by directoryPath
-    setQueue((prev) => {
-      const existing = new Set(prev.map((t) => t.directoryPath));
-      return [...prev, ...transfers.filter((t) => !existing.has(t.directoryPath))];
+  /**
+   * Awaits the receive buffer falling below the low-water mark.
+   *
+   * Driven purely off `onbufferedamountlow`, which fires as a task and so is
+   * not subject to the timer clamping that throttled the old loop.
+   */
+  const waitForDrain = useCallback((channel: RTCDataChannel): Promise<void> => {
+    if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) return Promise.resolve();
+    return new Promise((resolve) => {
+      const finish = () => {
+        channel.removeEventListener('bufferedamountlow', finish);
+        clearTimeout(timer);
+        resolve();
+      };
+      // A lost low-water event must not deadlock the transfer forever.
+      const timer = setTimeout(finish, 1000);
+      channel.addEventListener('bufferedamountlow', finish, { once: true });
     });
   }, []);
 
-  const COMPRESSED_EXTS = new Set([
-    // archives
-    'zip',
-    'rar',
-    '7z',
-    'gz',
-    'tgz',
-    'bz2',
-    'xz',
-    'zst',
-    'tar',
-    'iso',
-    'dmg',
-    'apk',
-    // video
-    'mp4',
-    'mkv',
-    'mov',
-    'avi',
-    'webm',
-    'm4v',
-    'mpg',
-    'mpeg',
-    'wmv',
-    'flv',
-    'ts',
-    // images
-    'jpg',
-    'jpeg',
-    'png',
-    'webp',
-    'gif',
-    'heic',
-    'heif',
-    'avif',
-    'tiff',
-    // audio
-    'mp3',
-    'wav',
-    'flac',
-    'ogg',
-    'opus',
-    'm4a',
-    'aac',
-    'wma',
-    // documents that are zip containers internally
-    'docx',
-    'xlsx',
-    'pptx',
-    'odt',
-    'ods',
-    'odp',
-    'epub',
-    // other already-compressed
-    'pdf',
-  ]);
-
-  function shouldCompress(fileName: string): boolean {
-    const ext = fileName.split('.').pop()?.toLowerCase();
-    return !COMPRESSED_EXTS.has(ext || '');
-  }
-
-  // [transferIdLength][transferId][chunkSize][isCompressed][chunk]
-  function createPacket(transferId: string, chunk: Uint8Array, isCompressed: boolean) {
-    const transferIdBuf = new TextEncoder().encode(transferId);
-    const headerSize = 4 + transferIdBuf.length + 4 + 1;
-    const packet = new ArrayBuffer(headerSize + chunk.byteLength);
-    const view = new DataView(packet);
-
-    let offset = 0;
-    view.setUint32(offset, transferIdBuf.length);
-    offset += 4;
-
-    new Uint8Array(packet, offset, transferIdBuf.length).set(transferIdBuf);
-    offset += transferIdBuf.length;
-
-    view.setUint32(offset, chunk.byteLength);
-    offset += 4;
-
-    view.setUint8(offset, isCompressed ? 1 : 0);
-    offset += 1;
-
-    new Uint8Array(packet, offset).set(new Uint8Array(chunk));
-
-    return packet;
-  }
-
-  // ---------------------------- SEND ------------------------------------
   const sendFile = useCallback(
-    async ({ file, transferId, directoryPath, thumbnail }: Transfer) => {
-      // Ensure data channel is available and open
-      if (!dataChannel || dataChannel.readyState !== 'open') {
+    async (item: TransferItem) => {
+      const channel = dataChannel;
+      if (!channel || channel.readyState !== 'open') {
         throw new Error('Connection closed');
       }
 
-      const controls = transferControls.current[transferId];
-      if (!controls) throw new Error('No controls for transfer');
+      const controls = outgoing.current.get(item.transferId);
+      if (!controls) throw new Error('Transfer no longer exists');
 
-      const total = file.size;
-      let sent = 0;
+      const session = nextSession.current++ & 0xffff;
+      const { file } = item;
 
-      const compress = shouldCompress(file.name);
-      const hash = await sha256Hex(file);
+      // Hashing strategy. Small files use native SubtleCrypto, which is about
+      // an order of magnitude faster. Large files are hashed incrementally as
+      // the bytes stream past, because reading a multi-gigabyte file into
+      // memory to hash it is what used to kill the tab on a phone.
+      const hashUpFront = file.size <= NATIVE_HASH_LIMIT_BYTES;
+      const hasher = hashUpFront ? null : new Sha256();
+      const announcedHash = hashUpFront ? await hashBlob(file) : undefined;
 
-      // JSON messages count towards maxMessageSize too.
-      // If thumbnail is still too big, we omit it to save the connection.
-      const initMsg = JSON.stringify({
-        type: 'init',
-        transferId,
-        directoryPath,
-        size: total,
-        thumbnail,
-        hash,
-      });
-      const initByteLen = new TextEncoder().encode(initMsg).length;
-
-      if (peerMax > 0 && initByteLen > peerMax) {
-        controlSend(JSON.stringify({ type: 'init', transferId, directoryPath, size: total, hash }));
-      } else {
-        controlSend(initMsg);
+      if (
+        !sendControl({
+          type: 'begin',
+          session,
+          transferId: item.transferId,
+          path: item.directoryPath,
+          size: file.size,
+          hash: announcedHash,
+          mime: file.type,
+          thumb: undefined,
+        })
+      ) {
+        throw new Error('Connection closed');
       }
 
+      // Sample the first chunk to decide whether compression is worth it, and
+      // remember the answer for the rest of the file.
+      const mayCompress = !isKnownCompressed(item.directoryPath, file.type);
+      let compressThisFile = mayCompress;
+
       let offset = 0;
-      while (offset < total) {
-        // Yield control to let the browser process network/UI tasks
-        await new Promise((res) => setTimeout(res, 0));
+      let sequence = 0;
+
+      while (offset < file.size) {
         if (controls.canceled) {
-          try {
-            controlSend(JSON.stringify({ type: 'cancel', transferId }));
-          } catch {}
-          setQueue((q) =>
-            q.map((x) => (x.transferId === transferId ? { ...x, status: 'canceled' } : x)),
-          );
-          addToHistory({
-            id: transferId,
-            name: directoryPath,
-            size: total,
-            type: 'send',
-            status: 'canceled',
-            thumbnail,
-          });
-          throw new Error('Canceled');
+          sendControl({ type: 'cancel', session });
+          throw new CanceledError();
         }
+
         if (controls.paused) {
-          try {
-            controlSend(JSON.stringify({ type: 'pause', transferId }));
-          } catch {}
-          await controls.resumePromise;
-          try {
-            controlSend(JSON.stringify({ type: 'resume', transferId }));
-          } catch {}
-        }
-
-        // Robust Backpressure
-        if (dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
-          await new Promise<void>((res) => {
-            const timeout = setTimeout(res, 100); // Fallback timeout
-            const listener = () => {
-              clearTimeout(timeout);
-              dataChannel.onbufferedamountlow = null;
-              res();
-            };
-            dataChannel.bufferedAmountLowThreshold = BUFFER_THRESHOLD / 2;
-            dataChannel.onbufferedamountlow = listener;
+          sendControl({ type: 'pause', session });
+          await new Promise<void>((resolve) => {
+            controls.resumeResolve = resolve;
           });
+          controls.resumeResolve = null;
+          if (controls.canceled) {
+            sendControl({ type: 'cancel', session });
+            throw new CanceledError();
+          }
+          sendControl({ type: 'resume', session });
         }
 
-        if (dataChannel.readyState !== 'open') throw new Error('Connection closed');
+        // Cooperative yield. Not every chunk: the browser copes with short
+        // bursts, and a task per chunk is its own overhead.
+        if ((sequence & 7) === 0) await yieldToEventLoop();
 
-        const chunkBlob = file.slice(offset, offset + CHUNK_SIZE);
-        const chunkBuffer = await chunkBlob.arrayBuffer();
-        const chunk = new Uint8Array(chunkBuffer);
+        if (channel.readyState !== 'open') throw new Error('Connection closed');
+        if (channel.bufferedAmount > 0) await waitForDrain(channel);
 
-        let finalData = chunk;
-        let isCompressed = false;
+        const end = Math.min(offset + chunkSize, file.size);
+        let payload = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+        let compressed = false;
 
-        if (compress) {
-          const compressed = lz4.compress(chunk);
-          if (compressed.length < chunk.length) {
-            finalData = compressed;
-            isCompressed = true;
+        if (compressThisFile) {
+          const { compress } = await import('lz4js');
+          const packed = compress(payload);
+          // Decide once, from the first chunk, and stick with it. Re-deciding per
+          // chunk meant a mixed file could be half compressed and half not.
+          if (sequence === 0) {
+            compressThisFile = shouldCompressSample(
+              item.directoryPath,
+              payload.length,
+              packed.length,
+              0.03,
+              file.type,
+            );
+          }
+          if (compressThisFile && packed.length < payload.length) {
+            // Copy into a concrete ArrayBuffer: lz4js hands back a view typed
+            // over ArrayBufferLike, which cannot be passed to `send`.
+            const buffer = new Uint8Array(packed.length);
+            buffer.set(packed);
+            payload = buffer;
+            compressed = true;
           }
         }
 
-        const packet = createPacket(transferId, finalData, isCompressed);
-
         try {
-          safeSend(dataChannel, packet);
-        } catch (err: any) {
-          if (err.name === 'OperationError') {
-            // Buffer actually full, wait more
-            await new Promise((res) => setTimeout(res, 200));
-            safeSend(dataChannel, packet); // Retry once
+          channel.send(encodeChunk(session, sequence, payload, compressed));
+        } catch (err) {
+          // A full send buffer is transient; anything else is terminal.
+          if ((err as DOMException)?.name === 'OperationError') {
+            await new Promise((r) => setTimeout(r, 50));
+            channel.send(encodeChunk(session, sequence, payload, compressed));
           } else {
             throw err;
           }
         }
 
-        // Metrics tracking (real-time via refs)
-        sent += chunk.length;
-        offset += chunk.length;
-        totalSentRef.current += chunk.length;
-        sendThroughputAccumulator.current += chunk.length;
+        const advanced = end - offset;
+        offset = end;
+        sequence += 1;
 
-        // Individual Progress tracking (throttled for UI)
-        const pct = (sent / total) * 100;
-        // Update individual queue item progress occasionally
-        if (Math.round(pct) % 5 === 0) {
+        sentRef.current += advanced;
+        sendAccum.current += advanced;
+
+        // Hash the plaintext, before compression, so the digest matches what
+        // the receiver hashes after decompression.
+        if (hasher) hasher.update(payload);
+
+        if (sequence % 8 === 0) {
+          const pct = Math.round((offset / file.size) * 100);
           setQueue((q) =>
-            q.map((x) => (x.transferId === transferId ? { ...x, progress: Math.round(pct) } : x)),
+            q.map((t) => (t.transferId === item.transferId ? { ...t, progress: pct } : t)),
           );
         }
       }
 
-      // Signal completion and update queues/meta
-      try {
-        controlSend(JSON.stringify({ type: 'done', transferId }));
-      } catch {}
+      sendControl({ type: 'end', session, hash: announcedHash ?? hasher?.hex() });
 
       setQueue((q) =>
-        q.map((x) => (x.transferId === transferId ? { ...x, progress: 100, status: 'done' } : x)),
+        q.map((t) =>
+          t.transferId === item.transferId
+            ? { ...t, progress: 100, bytesSent: file.size, status: 'done' }
+            : t,
+        ),
       );
-
-      // Stats update (persistent)
-      updateStats(1, total);
-
-      addToHistory({
-        id: transferId,
-        name: directoryPath,
-        size: total,
+      onStats(1, file.size);
+      void addToHistory({
+        id: item.transferId,
+        name: item.directoryPath,
+        size: file.size,
         type: 'send',
         status: 'done',
-        thumbnail,
       });
     },
-    [dataChannel, safeSend, updateStats],
+    [chunkSize, dataChannel, onStats, sendControl, waitForDrain],
   );
 
-  // ------------------------- RECEIVE  ---------------------------
-  function unpack(buffer: ArrayBuffer) {
-    const view = new DataView(buffer);
-    let offset = 0;
+  // -- receiving -------------------------------------------------------------
 
-    const transferIdLength = view.getUint32(offset);
-    offset += 4;
+  const failIncoming = useCallback(
+    async (record: IncomingRecord, message: string) => {
+      await record.sink.abort().catch(() => undefined);
+      incoming.current.delete(record.session);
+      setRecvQueue((rq) =>
+        rq.map((r) =>
+          r.transferId === record.transferId ? { ...r, status: 'error', error: message } : r,
+        ),
+      );
+      void addToHistory({
+        id: record.transferId,
+        name: record.path,
+        size: record.size,
+        type: 'receive',
+        status: 'error',
+      });
+      sendControl({ type: 'reject', session: record.session, reason: message });
+    },
+    [sendControl],
+  );
 
-    const transferId = new TextDecoder().decode(new Uint8Array(buffer, offset, transferIdLength));
+  const finalize = useCallback(
+    async (record: IncomingRecord) => {
+      record.closed = true;
+      setRecvQueue((rq) =>
+        rq.map((r) => (r.transferId === record.transferId ? { ...r, status: 'verifying' } : r)),
+      );
 
-    offset += transferIdLength;
+      let result;
+      try {
+        result = await record.sink.close();
+      } catch (err) {
+        await failIncoming(record, (err as Error).message);
+        return;
+      }
 
-    const chunkSize = view.getUint32(offset);
-    offset += 4;
+      if (record.size > 0 && record.received !== record.size) {
+        await failIncoming(
+          record,
+          `Incomplete transfer: got ${record.received} of ${record.size} bytes.`,
+        );
+        return;
+      }
 
-    const isCompressed = view.getUint8(offset) === 1;
-    offset += 1;
-
-    const chunk = buffer.slice(offset, offset + chunkSize);
-
-    return { transferId, chunk, isCompressed };
-  }
-
-  async function ProcessRecQue(transferId: string) {
-    // Process the queued decompressed chunks for a given transfer and write them
-    const rec = incoming.current[transferId];
-
-    if (!rec) {
-      console.warn('No matching incoming entry for:', transferId);
-      currentReceivingIdRef.current = null;
-      return;
-    }
-
-    try {
-      while (rec.queue.length > 0) {
-        const chunk = rec.queue.shift();
-        if (!chunk) continue;
-
-        try {
-          if (!rec.writer) return;
-          await rec.writer.write(new Uint8Array(chunk));
-          rec.received += chunk.byteLength;
-
-          // Metrics tracking (real-time via refs)
-          totalReceivedRef.current += chunk.byteLength;
-          receiveThroughputAccumulator.current += chunk.byteLength;
-
-          if (
-            !rec.lastProgressUpdate ||
-            Date.now() - rec.lastProgressUpdate > PROGRESS_INTERVAL_MS
-          ) {
-            setRecvQueue((rq) =>
-              rq.map((r) =>
-                r.transferId === transferId && r.status === 'receiving'
-                  ? {
-                      ...r,
-                      received: rec.received,
-                      progress: Math.round((rec.received / rec.size) * 100),
-                    }
-                  : r,
-              ),
-            );
-            rec.lastProgressUpdate = Date.now();
-          }
-        } catch (err) {
-          console.error('Writer error:', err);
-          try {
-            if (!rec.writer) return;
-            await rec.writer.abort?.();
-          } catch {}
-          delete incoming.current[transferId];
-          setRecvQueue((rq) =>
-            rq.map((r) => (r.transferId === transferId ? { ...r, status: 'error' } : r)),
-          );
-          addToHistory({
-            id: transferId,
-            name: rec.directoryPath || 'Unknown File',
-            size: rec.size,
-            type: 'receive',
-            status: 'error',
-          });
+      // Per-chunk CRC catches corruption. This catches reordering and
+      // truncation, which a CRC structurally cannot, because a chunk is
+      // perfectly valid on its own wherever it lands.
+      if (record.expectedHash) {
+        const actual = record.hasher.hex();
+        if (actual !== record.expectedHash) {
+          await failIncoming(record, 'Integrity check failed. The file was not saved.');
           return;
         }
       }
 
-      // If we've received the full file, close the writer and finalize state
-      if (rec.received >= rec.size) {
-        try {
-          if (!rec.writer) return;
-          await rec.writer.close();
-        } catch {}
-        rec.writing = false;
-        rec.writer = null;
-        currentReceivingIdRef.current = null;
-        delete incoming.current[transferId];
+      incoming.current.delete(record.session);
+      if (result.url)
+        results.current.set(record.session, { url: result.url, dispose: result.dispose });
 
-        // Integrity check: compare SHA-256 against the sender's digest
-        let integrityFailed = false;
-        if (rec.hash) {
-          let actual: string | undefined;
-          if (rec.verifyDisk) {
-            const saved = await rec.verifyDisk();
-            if (saved) actual = await sha256Hex(saved);
-          } else if (lastBlobRef.current) {
-            actual = await sha256Hex(lastBlobRef.current);
-          }
-          integrityFailed = actual !== undefined && actual !== rec.hash;
-          if (integrityFailed) console.error('Integrity check failed for', rec.directoryPath);
-        }
-        lastBlobRef.current = null;
-        rec.verifyDisk = null;
+      setRecvQueue((rq) =>
+        rq.map((r) =>
+          r.transferId === record.transferId
+            ? {
+                ...r,
+                status: 'done',
+                progress: 100,
+                received: record.received,
+                url: result.url,
+                downloaded: result.kind !== 'blob',
+              }
+            : r,
+        ),
+      );
 
-        setRecvQueue((rq) =>
-          rq.map((r) =>
-            r.transferId === transferId
-              ? { ...r, status: integrityFailed ? 'error' : 'done', progress: 100 }
-              : r,
-          ),
-        );
+      void addToHistory({
+        id: record.transferId,
+        name: record.path,
+        size: record.size,
+        type: 'receive',
+        status: 'done',
+      });
+    },
+    [failIncoming],
+  );
 
-        // Auto-download only after the integrity check has passed
-        if (!integrityFailed && pendingBlobUrlRef.current) {
-          tryAutoDownload(pendingBlobUrlRef.current.url, pendingBlobUrlRef.current.name);
-        }
-        pendingBlobUrlRef.current = null;
-
-        addToHistory({
-          id: transferId,
-          name: rec.directoryPath,
-          size: rec.size,
-          type: 'receive',
-          status: integrityFailed ? 'error' : 'done',
-          thumbnail: rec.thumbnail,
-        });
-
-        await new Promise((res) => setTimeout(res, 50));
-      }
-    } finally {
-      rec.writing = false;
-    }
-  }
-
-  const handleMessage = useCallback(async (event: MessageEvent) => {
-    if (typeof event.data === 'string') {
-      let msg: any;
+  const drain = useCallback(
+    async (record: IncomingRecord) => {
+      record.draining = true;
       try {
-        msg = JSON.parse(event.data);
-      } catch {
-        console.warn('Received string but not JSON:', event.data);
-        return;
-      }
-      const { type, transferId, directoryPath, size, thumbnail, hash } = msg;
+        while (record.queue.length > 0) {
+          if (record.controls.canceled) return;
 
-      if (type === 'chunk') {
-        currentReceivingIdRef.current = transferId;
-        return;
-      }
+          const chunk = record.queue.shift()!;
+          record.queuedBytes -= chunk.payload.byteLength;
 
-      // INIT message: prepare writer and metadata for incoming transfer
-      if (type === 'init') {
-        try {
-          let writer: WritableStreamDefaultWriter;
-          let chunks: Uint8Array[] | undefined = undefined;
-          let downloaded = false;
-          let verifyDisk: (() => Promise<File | null>) | null = null;
-
-          // Chromium with a chosen save folder: write any size straight to disk
-          const fsTarget = await createFileWriter(directoryPath);
-          if (fsTarget) {
-            writer = fsTarget.writer;
-            verifyDisk = fsTarget.verify;
-            downloaded = true;
-          } else if (size < MAX_RAM_SIZE) {
-            // Small file: buffer in-memory and produce a blob at the end
-            chunks = [];
-            writer = {
-              write: (chunk: Uint8Array) => {
-                chunks!.push(chunk);
-                return Promise.resolve();
-              },
-              close: () => {
-                const totalLength = chunks!.reduce((sum, c) => sum + c.length, 0);
-                const all = new Uint8Array(totalLength);
-                let offset = 0;
-                for (const c of chunks!) {
-                  all.set(c, offset);
-                  offset += c.length;
-                }
-
-                const blob = new Blob([all]);
-                lastBlobRef.current = blob;
-                const url = URL.createObjectURL(blob);
-                setRecvQueue((rq) =>
-                  rq.map((r) => (r.transferId === transferId ? { ...r, blobUrl: url } : r)),
-                );
-
-                pendingBlobUrlRef.current = { url, name: directoryPath };
-
-                if (chunks?.length) chunks.length = 0;
-
-                return Promise.resolve();
-              },
-              abort: () => {
-                chunks = undefined;
-                return Promise.resolve();
-              },
-              // Minimal stubs to satisfy WritableStreamDefaultWriter shape
-              get closed() {
-                return Promise.resolve();
-              },
-              get desiredSize() {
-                return null;
-              },
-              get ready() {
-                return Promise.resolve();
-              },
-              releaseLock: () => {},
-            } as WritableStreamDefaultWriter<any>;
-          } else {
-            // Large file: stream to disk using streamsaver
-            const streamSaver = (await import('streamsaver')).default;
-            const stream = streamSaver.createWriteStream(directoryPath, {
-              size,
-            });
-
-            downloaded = true;
-            writer = stream.getWriter();
+          if (!verifyChunk(chunk)) {
+            await failIncoming(
+              record,
+              'A chunk failed its integrity check. The file was not saved.',
+            );
+            return;
           }
 
-          incoming.current[transferId] = {
-            writer,
-            queue: [],
-            writing: false,
-            size,
+          let bytes = chunk.payload;
+          if (chunk.isCompressed) {
+            try {
+              const { decompress } = await import('lz4js');
+              bytes = decompress(chunk.payload);
+            } catch {
+              await failIncoming(
+                record,
+                'Could not decompress the transfer. Try a different browser.',
+              );
+              return;
+            }
+          }
+
+          try {
+            await record.sink.write(bytes);
+          } catch (err) {
+            // Most commonly "this device cannot store a file this large".
+            await failIncoming(record, (err as Error).message);
+            return;
+          }
+
+          record.received += bytes.byteLength;
+          record.hasher.update(bytes);
+          receivedRef.current += bytes.byteLength;
+          receiveAccum.current += bytes.byteLength;
+
+          const now = Date.now();
+          if (now - record.lastProgressAt > PROGRESS_INTERVAL_MS) {
+            record.lastProgressAt = now;
+            const pct = record.size > 0 ? Math.round((record.received / record.size) * 100) : 0;
+            setRecvQueue((rq) =>
+              rq.map((r) =>
+                r.transferId === record.transferId
+                  ? { ...r, received: record.received, progress: pct }
+                  : r,
+              ),
+            );
+          }
+        }
+      } finally {
+        record.draining = false;
+      }
+    },
+    [failIncoming],
+  );
+
+  // -- inbound dispatch ------------------------------------------------------
+
+  useEffect(() => {
+    const channels = [dataChannel, controlChannel].filter(Boolean) as RTCDataChannel[];
+    if (channels.length === 0) return;
+
+    const onMessage = async (event: MessageEvent) => {
+      // Control plane: JSON strings.
+      if (typeof event.data === 'string') {
+        let message: ControlMessage;
+        try {
+          message = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+
+        if (message.type === 'begin') {
+          const sink = await createSink(message.path, message.size);
+          if (sink.kind === 'none') {
+            sendControl({
+              type: 'reject',
+              session: message.session,
+              reason: 'This device cannot store a file that large.',
+            });
+            return;
+          }
+
+          const record: IncomingRecord = {
+            transferId: message.transferId,
+            session: message.session,
+            path: message.path,
+            size: message.size,
             received: 0,
-            lastProgressUpdate: 0,
-            directoryPath,
-            thumbnail,
-            hash,
-            verifyDisk,
+            hasher: new Sha256(),
+            reassembler: new Reassembler(),
+            sink,
+            expectedHash: message.hash,
+            queue: [],
+            queuedBytes: 0,
+            draining: false,
+            controls: newControls(),
+            lastProgressAt: 0,
+            closed: false,
           };
+          incoming.current.set(message.session, record);
 
           setRecvQueue((rq) => [
             ...rq,
             {
-              transferId,
-              directoryPath,
-              blobUrl: '',
-              size,
-              type: 'receive',
-              downloaded,
+              transferId: message.transferId,
+              directoryPath: message.path,
+              size: message.size,
               received: 0,
               progress: 0,
+              url: null,
+              type: 'receive',
+              downloaded: false,
               status: 'receiving',
-              thumbnail,
+              thumbnail: message.thumb,
+              storage: sink.kind,
             },
           ]);
-        } catch (err) {
-          console.error('Error creating write stream:', err);
-          setRecvQueue((rq) =>
-            rq.map((r) => (r.transferId === transferId ? { ...r, status: 'error' } : r)),
-          );
+          return;
         }
-        return;
-      }
 
-      // CONTROL messages (pause/resume/cancel)
-      if (type === 'pause') {
-        setRecvQueue((rq) =>
-          rq.map((r) =>
-            r.transferId === transferId && r.status === 'receiving'
-              ? { ...r, status: 'paused' }
-              : r,
-          ),
-        );
-        return;
-      }
-      if (type === 'resume') {
-        setRecvQueue((rq) =>
-          rq.map((r) =>
-            r.transferId === transferId && r.status === 'paused'
-              ? { ...r, status: 'receiving' }
-              : r,
-          ),
-        );
-        return;
-      }
-      if (type === 'cancel') {
-        // Cancel an incoming transfer
-        if (incoming.current[transferId]) {
-          try {
-            if (!incoming.current[transferId].writer) return;
-            incoming.current[transferId].writer.abort();
-          } catch {}
-          delete incoming.current[transferId];
+        const record = incoming.current.get(message.session);
+        if (message.type === 'pause' && record) {
+          record.controls.paused = true;
           setRecvQueue((rq) =>
-            rq.map((r) => (r.transferId === transferId ? { ...r, status: 'canceled' } : r)),
+            rq.map((r) => (r.transferId === record.transferId ? { ...r, status: 'paused' } : r)),
           );
           return;
         }
-        // Or remote cancelled our outgoing send -> mark as canceled locally
-        if (transferControls.current[transferId]) {
-          const controls = transferControls.current[transferId];
-          controls.canceled = true;
-          if (controls.paused && controls.resumeResolve) {
-            controls.paused = false;
-            controls.resumeResolve();
-          }
-          setQueue((q) =>
-            q.map((x) => (x.transferId === transferId ? { ...x, status: 'canceled' } : x)),
+        if (message.type === 'resume' && record) {
+          record.controls.paused = false;
+          setRecvQueue((rq) =>
+            rq.map((r) => (r.transferId === record.transferId ? { ...r, status: 'receiving' } : r)),
           );
+          if (!record.draining) void drain(record);
+          return;
         }
-        return;
-      }
-
-      // DONE (no-op here, writer close handled in ProcessRecQue)
-      if (type === 'done') {
-        return;
-      }
-      return;
-    }
-
-    // ----------------- Binary data path -----------------
-    const { transferId, chunk, isCompressed } = unpack(event.data);
-
-    const rec = incoming.current[transferId];
-    if (!rec) return;
-
-    // Decompress only if the sender flagged it as compressed
-    const decompressed = isCompressed
-      ? lz4.decompress(new Uint8Array(chunk))
-      : new Uint8Array(chunk);
-
-    rec.queue.push(decompressed.buffer);
-    if (!rec.writing) {
-      rec.writing = true;
-      ProcessRecQue(transferId);
-    }
-  }, []);
-
-  // ------------------------- Reset / cancel ----------------------------
-  function resetTransfer() {
-    // Cancel all ongoing controls and clear state
-    Object.values(transferControls.current).forEach((ctrl) => {
-      ctrl.canceled = true;
-      if (ctrl.paused && ctrl.resumeResolve) {
-        ctrl.paused = false;
-        ctrl.resumeResolve();
-      }
-    });
-
-    transferControls.current = {};
-    setQueue([]);
-
-    // Abort any active incoming writers
-    Object.values(incoming.current).forEach((rec) => {
-      rec.writer?.abort();
-    });
-
-    incoming.current = {};
-    setRecvQueue([]);
-
-    totalSentRef.current = 0;
-    totalReceivedRef.current = 0;
-    sendThroughputAccumulator.current = 0;
-    receiveThroughputAccumulator.current = 0;
-
-    setMeta({ totalReceived: 0, totalSent: 0, sendSpeedBps: 0, receiveSpeedBps: 0 });
-  }
-
-  // ------------------------- Setup handlers ----------------------------
-  useEffect(() => {
-    if (!dataChannel) return;
-    dataChannel.binaryType = 'arraybuffer';
-    dataChannel.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
-    dataChannel.onmessage = handleMessage;
-    dataChannel.onopen = () => {};
-    dataChannel.onclose = () => {
-      // Mark all sending transfers as paused and call disconnect
-      setQueue((q) =>
-        q.map((t) => {
-          if (t.status === 'sending') {
-            transferControls.current[t.transferId].paused = true;
-            return { ...t, status: 'paused' as const };
-          }
-          return t;
-        }),
-      );
-
-      disconnect();
-    };
-    dataChannel.onerror = (err) => {
-      // on any datachannel error we disconnect (original behavior)
-      disconnect();
-    };
-    return () => {
-      dataChannel.onmessage = null;
-      dataChannel.onopen = null;
-      dataChannel.onclose = null;
-      dataChannel.onerror = null;
-    };
-  }, [dataChannel, handleMessage]);
-
-  // Track IDs that are already in the processing queue to avoid duplicates
-  const enqueuedIds = useRef<Set<string>>(new Set());
-
-  // ----------------------- SENDING QUEUE runner -------------------------
-  useEffect(() => {
-    if (!dataChannel || dataChannel.readyState !== 'open') return;
-
-    queue.forEach((t) => {
-      if (t.status !== 'queued' || enqueuedIds.current.has(t.transferId)) return;
-
-      enqueuedIds.current.add(t.transferId);
-
-      // mark as sending and enqueue the send job
-      setQueue((q) =>
-        q.map((x) => (x.transferId === t.transferId ? { ...x, status: 'sending' } : x)),
-      );
-
-      pq.current.add(async () => {
-        try {
-          await pRetry(() => sendFile(t), { retries: 0 });
-        } catch (err: any) {
-          if (err.message === 'Canceled') {
-            // already handled
+        if (message.type === 'cancel') {
+          if (record) {
+            await record.sink.abort().catch(() => undefined);
+            incoming.current.delete(message.session);
+            setRecvQueue((rq) =>
+              rq.map((r) =>
+                r.transferId === record.transferId ? { ...r, status: 'canceled' } : r,
+              ),
+            );
           } else {
-            console.error('Send failed for', t.transferId, err);
+            // The sender cancelled something we were sending.
+            for (const controls of outgoing.current.values()) controls.canceled = true;
+          }
+          return;
+        }
+        if (message.type === 'end') {
+          if (record) {
+            // Large files only reveal their digest at the end.
+            if (message.hash) record.expectedHash = message.hash;
+            await finalize(record);
+          }
+          return;
+        }
+        if (message.type === 'reject') {
+          // The receiver could not store the file. Fail our send immediately
+          // rather than pushing gigabytes at a device that cannot keep them.
+          const failed = [...outgoing.current.entries()].find(([, c]) => c.canceled);
+          if (failed) {
+            const [id, controls] = failed;
+            controls.canceled = true;
             setQueue((q) =>
-              q.map((x) => (x.transferId === t.transferId ? { ...x, status: 'error' } : x)),
+              q.map((t) =>
+                t.transferId === id ? { ...t, status: 'error', error: message.reason } : t,
+              ),
             );
           }
-        } finally {
-          enqueuedIds.current.delete(t.transferId);
+          return;
         }
-      });
-    });
-  }, [queue, dataChannel, sendFile]);
+        return;
+      }
 
-  // Re-run queued sends whenever the dataChannel becomes open
-  useEffect(() => {
-    if (!dataChannel) return;
-    const onOpen = () => {
-      setQueue((prev) => [...prev]);
+      // Data plane: binary chunks.
+      let chunk: DecodedChunk;
+      try {
+        chunk = decodeChunk(event.data);
+      } catch {
+        // A malformed frame is dropped, not thrown. The receiver cannot do
+        // anything about it and must not die trying.
+        return;
+      }
+
+      const record = incoming.current.get(chunk.sessionId);
+      if (!record || record.closed) return;
+
+      // Bounded buffering. Beyond the hard limit the chunk is dropped rather
+      // than retained, which lets the reassembler's gap timeout surface a real
+      // stall instead of exhausting the heap.
+      if (record.queuedBytes + chunk.payload.byteLength > RECEIVE_HARD_LIMIT) return;
+
+      for (const ready of record.reassembler.push(chunk.sequence, chunk.payload)) {
+        record.queue.push({ ...chunk, payload: ready });
+        record.queuedBytes += ready.byteLength;
+      }
+
+      if (!record.draining) void drain(record);
+
+      // Ask the sender to ease off once we are buffering more than we should.
+      if (record.queuedBytes > RECEIVE_HIGH_WATER) {
+        sendControl({ type: 'pause', session: record.session });
+      }
     };
 
-    if (dataChannel.readyState === 'open') {
-      onOpen();
+    const onClose = () => {
+      for (const record of incoming.current.values()) {
+        record.controls.canceled = true;
+        void record.sink.abort().catch(() => undefined);
+      }
+      incoming.current.clear();
+      setQueue((q) => q.map((t) => (t.status === 'sending' ? { ...t, status: 'paused' } : t)));
+      onDisconnect();
+    };
+
+    for (const channel of channels) {
+      channel.binaryType = 'arraybuffer';
+      channel.addEventListener('message', onMessage);
+      channel.addEventListener('close', onClose);
+      channel.addEventListener('error', onClose);
     }
 
-    dataChannel.addEventListener('open', onOpen);
-
     return () => {
-      dataChannel.removeEventListener('open', onOpen);
+      for (const channel of channels) {
+        channel.removeEventListener('message', onMessage);
+        channel.removeEventListener('close', onClose);
+        channel.removeEventListener('error', onClose);
+      }
     };
-  }, [dataChannel]);
+  }, [controlChannel, dataChannel, drain, finalize, onDisconnect, sendControl]);
 
-  // ------------------------- Control helpers ---------------------------
-  const pauseTransfer = useCallback((transferId: string) => {
+  // -- queue runner ----------------------------------------------------------
+
+  const running = useRef(new Set<string>());
+
+  useEffect(() => {
+    const next = queue.find((t) => t.status === 'queued' && !running.current.has(t.transferId));
+    if (!next) return;
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+
+    running.current.add(next.transferId);
     setQueue((q) =>
-      q.map((x) => {
-        if (x.transferId === transferId && (x.status === 'sending' || x.status === 'queued')) {
-          const controls = transferControls.current[transferId];
-          if (controls) {
-            controls.paused = true;
-            controls.resumePromise = new Promise((res) => {
-              controls.resumeResolve = res;
-            });
-          }
-          return { ...x, status: 'paused' };
-        }
-        return x;
-      }),
+      q.map((t) => (t.transferId === next.transferId ? { ...t, status: 'sending' } : t)),
+    );
+
+    void sendFile(next)
+      .catch((err: unknown) => {
+        if (err instanceof CanceledError) return;
+        const message = (err as Error)?.message ?? 'Transfer failed';
+        setQueue((q) =>
+          q.map((t) =>
+            t.transferId === next.transferId ? { ...t, status: 'error', error: message } : t,
+          ),
+        );
+        void addToHistory({
+          id: next.transferId,
+          name: next.directoryPath,
+          size: next.file.size,
+          type: 'send',
+          status: 'error',
+        });
+      })
+      .finally(() => {
+        running.current.delete(next.transferId);
+      });
+  }, [dataChannel, queue, sendFile]);
+
+  // -- selection -------------------------------------------------------------
+
+  const enqueueFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
+    const items: TransferItem[] = files.map((file) => {
+      const transferId = crypto.randomUUID();
+      outgoing.current.set(transferId, newControls());
+      return {
+        transferId,
+        file,
+        directoryPath: file.name,
+        progress: 0,
+        bytesSent: 0,
+        status: 'queued' as const,
+      };
+    });
+    setQueue((prev) => {
+      const seen = new Set(prev.map((t) => t.directoryPath));
+      return [...prev, ...items.filter((i) => !seen.has(i.directoryPath))];
+    });
+  }, []);
+
+  const handleFileSelect = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      await enqueueFiles(await collectFiles(event.target.files));
+      // Allow re-selecting the same file.
+      event.target.value = '';
+    },
+    [enqueueFiles],
+  );
+
+  // -- controls --------------------------------------------------------------
+
+  const pauseTransfer = useCallback((transferId: string) => {
+    const controls = outgoing.current.get(transferId);
+    if (controls) controls.paused = true;
+    setQueue((q) =>
+      q.map((t) =>
+        t.transferId === transferId && t.status === 'sending' ? { ...t, status: 'paused' } : t,
+      ),
     );
   }, []);
 
   const resumeTransfer = useCallback((transferId: string) => {
+    const controls = outgoing.current.get(transferId);
+    if (controls) {
+      controls.paused = false;
+      controls.resumeResolve?.();
+    }
     setQueue((q) =>
-      q.map((x) => {
-        if (x.transferId === transferId && x.status === 'paused') {
-          const controls = transferControls.current[transferId];
-          if (controls) {
-            controls.paused = false;
-            controls.resumeResolve?.();
-            controls.resumePromise = undefined;
-            controls.resumeResolve = undefined;
-          }
-          const nextStatus = x.progress > 0 ? 'sending' : 'queued';
-          return { ...x, status: nextStatus };
-        }
-        return x;
-      }),
+      q.map((t) =>
+        t.transferId === transferId && t.status === 'paused' ? { ...t, status: 'sending' } : t,
+      ),
     );
   }, []);
 
-  const cancelTransfer = useCallback(
-    (transferId: string) => {
-      // Mark local send as canceled and notify remote
-      const controls = transferControls.current[transferId];
-      if (controls) {
-        controls.canceled = true;
-        if (controls.paused && controls.resumeResolve) {
-          controls.paused = false;
-          controls.resumeResolve();
-        }
-      }
-      setQueue((q) =>
-        q.map((x) => (x.transferId === transferId ? { ...x, status: 'canceled' } : x)),
-      );
-      if (dataChannel) {
-        try {
-          controlSend(JSON.stringify({ type: 'cancel', transferId }));
-        } catch {}
-      }
-
-      const item = queue.find((q) => q.transferId === transferId);
-      if (item) {
-        addToHistory({
-          id: transferId,
-          name: item.directoryPath,
-          size: item.file.size,
-          type: 'send',
-          status: 'canceled',
-          thumbnail: item.thumbnail,
-        });
-      }
-    },
-    [dataChannel, queue],
-  );
+  const cancelTransfer = useCallback((transferId: string) => {
+    const controls = outgoing.current.get(transferId);
+    if (controls) {
+      controls.canceled = true;
+      controls.resumeResolve?.();
+    }
+    setQueue((q) => q.map((t) => (t.transferId === transferId ? { ...t, status: 'canceled' } : t)));
+  }, []);
 
   const cancelReceive = useCallback(
     (transferId: string) => {
-      // Cancel a receiving transfer and notify remote
-      const rec = incoming.current[transferId];
-      if (rec) {
-        if (rec.writer) {
-          try {
-            rec.writer.abort();
-          } catch {}
-        }
-
-        addToHistory({
-          id: transferId,
-          name: rec.directoryPath,
-          size: rec.size,
-          type: 'receive',
-          status: 'canceled',
-          thumbnail: rec.thumbnail,
-        });
-
-        delete incoming.current[transferId];
+      // Find first, then delete. Deleting while iterating a Map is legal but
+      // reads as if it might skip an entry.
+      const entry = [...incoming.current.entries()].find(
+        ([, record]) => record.transferId === transferId,
+      );
+      if (entry) {
+        const [session, record] = entry;
+        record.controls.canceled = true;
+        void record.sink.abort().catch(() => undefined);
+        incoming.current.delete(session);
+        sendControl({ type: 'cancel', session });
       }
       setRecvQueue((rq) =>
         rq.map((r) => (r.transferId === transferId ? { ...r, status: 'canceled' } : r)),
       );
-      if (currentReceivingIdRef.current === transferId) {
-        currentReceivingIdRef.current = null;
-      }
-      if (dataChannel) {
-        try {
-          controlSend(JSON.stringify({ type: 'cancel', transferId }));
-        } catch {}
-      }
     },
-    [dataChannel, safeSend],
+    [sendControl],
   );
 
-  // STATUS view for consumers
-  const userQueue = queue.map((t) => ({
-    ...t,
-    userStatus: statusMap[t.status],
-  }));
+  // -- downloads and cleanup -------------------------------------------------
 
-  // --------------------------- Return ------------------------------
+  const downloadFile = useCallback((item: ReceivedItem) => {
+    if (!item.url) return;
+    const anchor = document.createElement('a');
+    anchor.href = item.url;
+    anchor.download = item.directoryPath.split('/').pop() ?? item.directoryPath;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setRecvQueue((rq) =>
+      rq.map((r) => (r.transferId === item.transferId ? { ...r, downloaded: true } : r)),
+    );
+  }, []);
+
+  /**
+   * Releases every object URL we created.
+   *
+   * Without this, every received blob URL lives until the document unloads. On
+   * a phone that is the difference between finishing a session and being
+   * OOM-killed halfway through the next one.
+   */
+  const releaseUrls = useCallback(() => {
+    for (const { dispose } of results.current.values()) dispose?.();
+    results.current.clear();
+    setRecvQueue((rq) => rq.map((r) => ({ ...r, url: null })));
+  }, []);
+
+  const reset = useCallback(() => {
+    for (const controls of outgoing.current.values()) {
+      controls.canceled = true;
+      controls.resumeResolve?.();
+    }
+    outgoing.current.clear();
+    for (const record of incoming.current.values()) {
+      record.controls.canceled = true;
+      void record.sink.abort().catch(() => undefined);
+    }
+    incoming.current.clear();
+    releaseUrls();
+    setQueue([]);
+    setRecvQueue([]);
+    sentRef.current = 0;
+    receivedRef.current = 0;
+    sendAccum.current = 0;
+    receiveAccum.current = 0;
+    setMetrics({ totalSent: 0, totalReceived: 0, sendSpeedBps: 0, receiveSpeedBps: 0 });
+  }, [releaseUrls]);
+
+  // Abandon in-flight work when the component goes away, and release URLs even
+  // if nothing else calls reset.
+  useEffect(() => {
+    const records = incoming.current;
+    const urls = results.current;
+    const sends = outgoing.current;
+    return () => {
+      for (const controls of sends.values()) {
+        controls.canceled = true;
+        controls.resumeResolve?.();
+      }
+      for (const record of records.values()) {
+        record.controls.canceled = true;
+        void record.sink.abort().catch(() => undefined);
+      }
+      records.clear();
+      for (const { dispose } of urls.values()) dispose?.();
+      urls.clear();
+    };
+  }, []);
+
   return {
-    queue: userQueue,
-    downloadAll,
-    downloadFile,
-    resetTransfer,
-    openFile,
+    queue: useMemo(() => queue.map((t) => ({ ...t, label: STATUS_LABELS[t.status] })), [queue]),
     recvQueue,
-    meta,
-    setAutoDownload,
-    autoDownload,
+    metrics,
+    storageLabel: describeStrategy,
     handleFileSelect,
+    enqueueFiles,
     pauseTransfer,
     resumeTransfer,
     cancelTransfer,
-    setMeta,
-    setQueue,
-    setRecvQueue,
     cancelReceive,
-    handleMessage,
+    downloadFile,
+    releaseUrls,
+    reset,
   };
+}
+
+class CanceledError extends Error {
+  constructor() {
+    super('Canceled');
+    this.name = 'CanceledError';
+  }
 }
