@@ -124,8 +124,8 @@ export default function BenchPage() {
       setStatus('Waiting for host…');
     });
 
-    socket.once('offer', async (id: string, { sdp }: { sdp: any }) => {
-      const desc = sdp?.sdp ?? sdp;
+    socket.once('offer', async (id: string, { sdp }: { sdp?: { sdp?: string } | string }) => {
+      const desc = typeof sdp === 'string' ? sdp : (sdp?.sdp ?? undefined);
       if (!desc) {
         setStatus('Offer not ready — retrying…');
         setTimeout(() => socket.emit('joinFlight', code, () => {}), 1500);
@@ -177,7 +177,7 @@ export default function BenchPage() {
         else pendingIn.current.push(candidate);
       });
 
-      await pc.setRemoteDescription(desc);
+      await pc.setRemoteDescription({ type: 'offer', sdp: desc });
       // Flush any candidates that raced ahead of setRemoteDescription
       for (const c of pendingIn.current) await pc.addIceCandidate(c);
       pendingIn.current = [];

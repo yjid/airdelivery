@@ -1,347 +1,440 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+/**
+ * Flight room.
+ *
+ * Changes worth calling out:
+ *
+ *  - Every failure mode now has a visible, actionable state. The previous page
+ *    set a status string and hoped the user could interpret it; the worst case
+ *    was an indefinite spinner after the other side disconnected.
+ *  - `inviteToFlight` is called with `.catch()`. It rejects on failure and both
+ *    call sites ignored the promise, so every failed invite produced an
+ *    unhandled rejection.
+ *  - The QR modal traps focus, closes on Escape, and labels itself.
+ *  - Code entry is normalised, so a lowercase or mistyped code still works.
+ *  - A `full` flight shows an explanation plus a way to host instead, rather
+ *    than a dead-end page.
+ */
+
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { File, Folder, Share2, Users, User, ScanQrCode, RefreshCwIcon, LogOut } from 'lucide-react';
+import { File, Folder, LogOut, QrCode, RefreshCw, Share2, User, Users, X } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
+import { normalizeFlightCode } from '@airdelivery/protocol';
 import { Badge } from '@/lib/badge';
-import { useWebRTCState, useWebRTCActions } from '@/context/WebRTCContext';
+import { useWebRTCActions, useWebRTCState } from '@/context/WebRTCContext';
 import { MetricsSection } from '@/components/room/MetricSection';
 import { QueueTray } from '@/components/room/QueueTray';
-import AsktoShareSection from '@/components/room/share';
+import { AskToShareSection } from '@/components/room/share';
 
-export default function RoomPage() {
-  // --- route / flight code ------------------------------------------------
-  const { code } = useParams();
-  const flight = typeof code === 'string' ? code : '';
+const STATUS_COPY: Record<string, string> = {
+  idle: 'Create or join a flight to begin.',
+  waiting: 'Waiting for the other device to join…',
+  connecting: 'Establishing a direct connection…',
+  connected: 'Connected. Files transfer directly between the devices.',
+  reconnecting: 'Connection interrupted. Trying to recover…',
+  disconnected: 'Disconnected.',
+  failed: 'Could not connect.',
+};
 
-  // --- local UI state ----------------------------------------------------
-  const [showQR, setShowQR] = useState(false);
-  const [isSpinning, setIsSpinning] = useState(false);
-  const [isLeft, setIsLeft] = useState(false);
+const FAILURE_COPY: Record<string, { title: string; body: string }> = {
+  FULL: {
+    title: 'This flight is already full',
+    body: 'Two devices can share in one flight. Create a new flight to send to someone else.',
+  },
+  NOT_FOUND: {
+    title: 'That flight code does not exist',
+    body: 'Check the code with the sender, or create a new flight.',
+  },
+  BAD_CODE: {
+    title: 'That is not a valid flight code',
+    body: 'Flight codes are 6 characters. Letters that look alike are usually the issue.',
+  },
+  OFFLINE: {
+    title: 'That device is no longer online',
+    body: 'They may have closed the tab or changed network.',
+  },
+};
+
+export default function FlightPage() {
+  const params = useParams();
+  const raw = typeof params?.code === 'string' ? params.code : '';
+  const code = normalizeFlightCode(raw) ?? raw.toUpperCase();
+  const valid = normalizeFlightCode(raw) !== null;
 
   const router = useRouter();
-
-  // --- webRTC / transfers context ---------------------------------------
   const {
     handleFileSelect,
     leaveFlight,
     connectToFlight,
     cancelTransfer,
+    cancelReceive,
     downloadFile,
-    resumeTransfer,
     pauseTransfer,
+    resumeTransfer,
     refreshNearby,
     inviteToFlight,
-    setAutoDownload,
+    requestDirectConnect,
+    restartIce,
   } = useWebRTCActions();
 
-  const { meta, recvQueue, queue, autoDownload, status, members, nearByUsers, flightId } =
+  const { metrics, recvQueue, queue, status, failure, members, nearByUsers, flightId } =
     useWebRTCState();
 
-  // Missing setAutoDownload? Added it to state context if needed or use hook directly.
-  // For now I'll just assume it's in actions or state.
-  // Actually I forgot setAutoDownload in actions. I'll add it.
+  const [showQr, setShowQr] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const qrClose = useRef<HTMLButtonElement>(null);
 
-  // --- handlers ----------------------------------------------------------
-  const handleLeave = () => {
-    setIsLeft(true);
-    leaveFlight();
-    router.push('/');
-  };
+  const inThisFlight = flightId === code;
+
+  // Join, or explain why we cannot.
+  useEffect(() => {
+    if (!valid) return;
+    if (inThisFlight) return;
+    connectToFlight(code);
+  }, [code, connectToFlight, inThisFlight, valid]);
+
+  // Canonicalise the URL so a lowercase or mistyped link becomes shareable.
+  useEffect(() => {
+    const normalized = normalizeFlightCode(raw);
+    if (normalized && normalized !== raw) router.replace(`/flight/${normalized}`);
+  }, [raw, router]);
 
   useEffect(() => {
-    if (!flight) return;
-    if (flightId === flight) return;
-    if (isLeft) return;
-
-    const handleSwitch = () => {
-      if (flightId && flightId !== flight) {
-        const leave = confirm(
-          `You are already in flight "${flightId}". Leave it and join "${flight}"?`,
-        );
-        if (leave) {
-          leaveFlight();
-          connectToFlight(flight);
-        } else {
-          router.push(`/flight/${flightId}`);
-        }
-      } else {
-        connectToFlight(flight);
-      }
+    if (!showQr) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setShowQr(false);
     };
+    window.addEventListener('keydown', onKey);
+    qrClose.current?.focus();
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showQr]);
 
-    handleSwitch();
-  }, [flight, flightId, connectToFlight, leaveFlight, router, isLeft]);
+  const handleLeave = useCallback(() => {
+    leaveFlight();
+    router.push('/');
+  }, [leaveFlight, router]);
 
-  // Refresh nearby users with a short spin animation
-  const handleRefresh = () => {
-    setIsSpinning(true);
+  const handleRefresh = useCallback(() => {
+    setRefreshing(true);
     refreshNearby();
-    setTimeout(() => setIsSpinning(false), 500);
-  };
+    setTimeout(() => setRefreshing(false), 500);
+  }, [refreshNearby]);
 
-  // -----------------------------------------------------------------------
-  // Render
-  // -----------------------------------------------------------------------
+  /**
+   * Every rejection is handled. Previously unhandled, producing an unhandled
+   * rejection on each failed invite.
+   */
+  const runInvite = useCallback(async (action: () => Promise<unknown>, successMessage?: string) => {
+    try {
+      await action();
+      setNotice(successMessage ?? null);
+    } catch (err) {
+      setNotice((err as Error).message || 'That did not work.');
+    }
+  }, []);
+
+  const failureCopy = failure ? FAILURE_COPY[failure] : null;
+  const origin = typeof window !== 'undefined' ? `${window.location.origin}/flight/${code}` : '';
+
   return (
-    <main className="min-h-screen bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 py-8 px-4 sm:px-6 lg:px-8">
-      <div className="max-w-5xl mx-auto space-y-8">
-        {/* Header */}
-        <header className="flex flex-col md:flex-row justify-between items-start md:items-center bg-white dark:bg-zinc-900 rounded-2xl shadow-xl p-6 sm:p-8 gap-6 mb-6 transition-all border dark:border-zinc-800">
-          {/* Left: Flight Info */}
-          <div className="flex flex-col gap-3 w-full md:w-auto">
-            <div className="flex flex-wrap items-center gap-3">
-              <h1 className="text-xl sm:text-2xl font-extrabold tracking-wide flex items-center gap-2">
-                FLIGHT
-                <span className="bg-zinc-100 dark:bg-zinc-800 text-xl sm:text-xl font-mono text-zinc-700 dark:text-zinc-300 px-2 py-1 rounded-lg border border-zinc-200 dark:border-zinc-700">
-                  {flight}
-                </span>
-              </h1>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3 mt-1 text-sm">
+    <main
+      id="main"
+      className="min-h-screen bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 py-8 px-4 sm:px-6 lg:px-8"
+    >
+      <div className="max-w-5xl mx-auto space-y-6">
+        <header className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border border-zinc-200 dark:border-zinc-800 p-6">
+          <div>
+            <h1 className="text-xl sm:text-2xl font-extrabold tracking-wide flex items-center gap-2">
+              <span className="sr-only">Flight</span>
+              <span className="text-sm uppercase tracking-widest text-zinc-500 font-bold">
+                Flight
+              </span>
+              <span className="font-mono text-orange-600">{code || '—'}</span>
+            </h1>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
               <Badge
-                color={
-                  status === 'Connected'
-                    ? 'green'
-                    : status.includes('failed') || status.includes('Disconnected')
-                      ? 'red'
-                      : 'yellow'
-                }
+                color={status === 'connected' ? 'green' : status === 'failed' ? 'red' : 'yellow'}
               >
-                {status}
+                {STATUS_COPY[status] ?? status}
               </Badge>
-
               <Badge color="gray">
-                {members.length} Member{members.length !== 1 ? 's' : ''}
+                {members.length} member{members.length === 1 ? '' : 's'}
               </Badge>
+              {status === 'reconnecting' && (
+                <button
+                  type="button"
+                  onClick={() => void restartIce()}
+                  className="text-xs font-semibold text-orange-600 hover:underline"
+                >
+                  Retry now
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Right: Action Buttons */}
-          <div className="flex flex-wrap md:flex-nowrap items-start sm:items-center justify-start md:justify-end gap-3 md:gap-6 w-full md:w-auto">
-            {/* Show QR button */}
-            <div className="flex flex-col items-start sm:items-center">
-              <button
-                onClick={() => setShowQR((prev) => !prev)}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-full bg-orange-500 hover:bg-orange-600 text-white font-semibold shadow-md transition duration-200"
-              >
-                <ScanQrCode className="w-5 h-5 " />
-                <span className="text-sm">Show</span>
-              </button>
-
-              <span className="text-xs hidden md:inline text-zinc-500 dark:text-zinc-400 mt-1 sm:text-center">
-                Show QR or code
-              </span>
-            </div>
-
-            {/* Leave flight button */}
-            <div className="flex flex-col items-start sm:items-center">
-              <button
-                onClick={handleLeave}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-full bg-zinc-800 dark:bg-zinc-100 hover:bg-zinc-700 dark:hover:bg-zinc-200 text-white dark:text-zinc-900 font-semibold shadow-md transition duration-200"
-              >
-                <LogOut className="w-5 h-5" />
-                <span className="hidden text-sm md:inline">Leave</span>
-              </button>
-
-              <span className="text-xs hidden md:inline text-zinc-500 dark:text-zinc-400 mt-1 sm:text-center">
-                Leave the flight
-              </span>
-            </div>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setShowQr(true)}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-full bg-orange-500 hover:bg-orange-600 text-white font-semibold transition"
+            >
+              <QrCode className="w-5 h-5" aria-hidden="true" />
+              Invite
+            </button>
+            <button
+              type="button"
+              onClick={handleLeave}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-full bg-zinc-800 dark:bg-zinc-100 text-white dark:text-zinc-900 font-semibold transition hover:bg-zinc-700 dark:hover:bg-zinc-200"
+            >
+              <LogOut className="w-5 h-5" aria-hidden="true" />
+              Leave
+            </button>
           </div>
         </header>
 
-        {/* QR Share Modal (keeps exact structure & content) */}
-        {showQR && (
-          <div className="fixed animate-fadeIn inset-0 bg-zinc-900/60 dark:bg-black/80 h-screen flex items-center justify-center z-50 p-4">
-            <div className="relative bg-white dark:bg-zinc-900 rounded-3xl shadow-2xl p-8 w-full max-w-xs flex flex-col items-center border-2 border-orange-400">
-              <button
-                onClick={() => setShowQR(false)}
-                className="absolute top-3 right-3 text-zinc-400 hover:text-orange-600 text-2xl font-bold"
-                aria-label="Close"
-              >
-                ×
-              </button>
-
-              <div className="mb-2 flex items-center gap-2">
-                <span className="font-mono text-lg bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-400 px-3 py-1 rounded-lg border border-orange-200 dark:border-orange-800">
-                  {flight}
-                </span>
-              </div>
-
-              <h2 className="text-xl font-bold text-zinc-900 dark:text-zinc-100 mb-3 text-center">
-                Share this Flight
-              </h2>
-
-              <div className="flex justify-center mb-4 p-2 bg-white rounded-xl">
-                <QRCodeSVG
-                  value={typeof window !== 'undefined' ? window.location.href : ''}
-                  size={180}
-                />
-              </div>
-
-              <div className="w-full flex flex-col items-center mb-2">
-                <div className="flex items-center gap-2 w-full">
-                  <input
-                    className="flex-1 bg-zinc-100 dark:bg-zinc-800 rounded-lg px-2 py-1 text-sm font-mono border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300"
-                    value={typeof window !== 'undefined' ? window.location.href : ''}
-                    readOnly
-                    onFocus={(e) => e.target.select()}
-                  />
-
-                  <button
-                    onClick={async () => {
-                      if (typeof window !== 'undefined' && navigator.share) {
-                        await navigator.share({
-                          title: 'Join my Flight',
-                          text: 'Join my Flight on AirDelivery!',
-                          url: window.location.href,
-                        });
-                      }
-                    }}
-                    className="p-1 rounded hover:bg-orange-100 dark:hover:bg-orange-900/30 text-orange-600 dark:text-orange-400"
-                    title="Share via OS"
-                  >
-                    <Share2 className="w-5 h-5" />
-                  </button>
-                </div>
-
-                <span className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
-                  Ask the reciver to join.
-                </span>
-              </div>
-
-              <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400 text-center">
-                Scan QR or share the link to join this flight.
-              </p>
-            </div>
+        {/* Every dead end gets an explanation and a next step. */}
+        {(!valid || failureCopy) && (
+          <div
+            role="alert"
+            className="rounded-2xl border border-orange-300 dark:border-orange-700 bg-orange-50 dark:bg-orange-950/30 p-5"
+          >
+            <h2 className="font-bold text-orange-900 dark:text-orange-200">
+              {valid ? failureCopy?.title : 'That is not a flight code'}
+            </h2>
+            <p className="mt-1 text-sm text-orange-900/80 dark:text-orange-200/80">
+              {valid
+                ? failureCopy?.body
+                : 'Flight codes are 6 characters from A–Z and 2–9. Check the link or type the code in.'}
+            </p>
+            <button
+              type="button"
+              onClick={() => router.push('/')}
+              className="mt-4 px-4 py-2 rounded-full bg-orange-600 hover:bg-orange-700 text-white text-sm font-semibold"
+            >
+              Back to home
+            </button>
           </div>
         )}
 
-        {/* Main Content: Upload area + Users panel + Queue */}
+        {notice && (
+          <div
+            role="status"
+            className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3 text-sm"
+          >
+            {notice}
+          </div>
+        )}
+
         <section className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Upload area (left / large) */}
-          <div className="col-span-1 lg:col-span-2 bg-white dark:bg-zinc-900 p-6 rounded-3xl shadow-md flex flex-col items-center justify-center border dark:border-zinc-800">
-            <div
-              className="w-full h-56 flex flex-col items-center justify-center border-2 border-dashed border-orange-400 rounded-2xl bg-white dark:bg-zinc-900 hover:bg-orange-50 dark:hover:bg-orange-950/20 transition cursor-pointer p-6 text-center"
-              onDragOver={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-              }}
+          <div className="lg:col-span-2 bg-white dark:bg-zinc-900 p-6 rounded-3xl shadow-sm border border-zinc-200 dark:border-zinc-800">
+            <label
+              htmlFor="room-file-input"
+              onDragOver={(e) => e.preventDefault()}
               onDrop={(e) => {
                 e.preventDefault();
-                e.stopPropagation();
-                const files = Array.from(e.dataTransfer.files);
-                handleFileSelect({ target: { files } } as any);
+                void handleFileSelect({
+                  target: { files: e.dataTransfer.files },
+                } as never);
               }}
+              className="w-full min-h-56 flex flex-col items-center justify-center border-2 border-dashed border-orange-400 rounded-2xl bg-orange-50/40 dark:bg-orange-950/10 hover:bg-orange-50 dark:hover:bg-orange-950/20 transition p-6 text-center cursor-pointer"
             >
-              <Folder className="w-12 h-12 text-orange-500 mb-3" />
-              <p className="text-lg font-medium text-zinc-800 dark:text-zinc-200">
-                Drag & Drop files or folders
-              </p>
+              <Folder className="w-10 h-10 text-orange-500 mb-3" aria-hidden="true" />
+              <span className="text-lg font-medium">Drag and drop files or folders</span>
               <span className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-                or select manually
+                or choose them below
               </span>
 
-              <div className="mt-4 flex flex-wrap justify-center gap-3">
-                {/* Select files button */}
-                <label className="px-5 py-2 rounded-full bg-orange-500 hover:bg-orange-600 text-white font-medium flex items-center gap-2 text-sm cursor-pointer transition">
-                  <File className="w-4 h-4" />
-                  <span>Select Files</span>
-                  <input type="file" multiple hidden onChange={handleFileSelect} />
-                </label>
+              <span className="mt-4 flex flex-wrap justify-center gap-3">
+                <span className="px-4 py-2 rounded-full bg-orange-500 text-white text-sm font-medium inline-flex items-center gap-2">
+                  <File className="w-4 h-4" aria-hidden="true" />
+                  Files
+                </span>
+                <span className="px-4 py-2 rounded-full border border-orange-500 text-orange-600 dark:text-orange-400 text-sm font-medium inline-flex items-center gap-2">
+                  <Folder className="w-4 h-4" aria-hidden="true" />
+                  Folder
+                </span>
+              </span>
 
-                {/* Select folder button */}
-                <label className="px-5 py-2 rounded-full border border-orange-500 text-orange-600 dark:text-orange-400 hover:bg-orange-50 dark:hover:bg-orange-950/20 font-medium flex items-center gap-2 text-sm cursor-pointer transition">
-                  <Folder className="w-4 h-4" />
-                  <span>Select Folder</span>
-                  <input
-                    type="file"
-                    multiple
-                    hidden
-                    //@ts-ignore
-                    webkitdirectory="true"
-                    onChange={handleFileSelect}
-                  />
-                </label>
-              </div>
+              {/* Two inputs, because a folder picker and a file picker are
+                  different requests. One `webkitdirectory` input cannot do both. */}
+              <input
+                id="room-file-input"
+                type="file"
+                multiple
+                className="sr-only"
+                onChange={handleFileSelect}
+              />
+            </label>
+
+            <div className="mt-4 flex flex-wrap gap-3">
+              <label
+                htmlFor="room-files"
+                className="cursor-pointer px-4 py-2 rounded-full bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium"
+              >
+                Select files
+              </label>
+              <input
+                id="room-files"
+                type="file"
+                multiple
+                className="sr-only"
+                onChange={handleFileSelect}
+              />
+
+              <label
+                htmlFor="room-folder"
+                className="cursor-pointer px-4 py-2 rounded-full border border-orange-500 text-orange-600 dark:text-orange-400 text-sm font-medium"
+              >
+                Select folder
+              </label>
+              <input
+                id="room-folder"
+                type="file"
+                multiple
+                // @ts-expect-error non-standard but universally supported
+                webkitdirectory=""
+                className="sr-only"
+                onChange={handleFileSelect}
+              />
             </div>
           </div>
 
-          {/* Users Panel (right / small) */}
-          <div className="bg-white dark:bg-zinc-900 rounded-3xl shadow-md p-5 max-h-96 flex flex-col border dark:border-zinc-800">
+          <div className="bg-white dark:bg-zinc-900 rounded-3xl shadow-sm border border-zinc-200 dark:border-zinc-800 p-5 flex flex-col max-h-96">
             <div className="flex justify-between items-center mb-4">
-              <div className="flex items-center gap-2">
-                <Users className="w-5 h-5 text-orange-500" />
-                <h2 className="text-lg font-semibold text-zinc-800 dark:text-zinc-100">
-                  {members.length <= 1 ? 'Nearby Users' : 'In Flight'}
-                </h2>
-              </div>
-
+              <h2 className="flex items-center gap-2 text-lg font-semibold">
+                <Users className="w-5 h-5 text-orange-500" aria-hidden="true" />
+                {members.length > 1 ? 'In flight' : 'Devices nearby'}
+              </h2>
               {members.length <= 1 && (
                 <button
+                  type="button"
                   onClick={handleRefresh}
-                  className="p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 transition"
-                  title="Refresh"
+                  aria-label="Refresh nearby devices"
+                  className="p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800"
                 >
-                  <RefreshCwIcon
-                    className={`w-5 h-5 ${isSpinning ? 'animate-spin' : 'transition-transform'} dark:text-zinc-400`}
+                  <RefreshCw
+                    className={`w-5 h-5 text-zinc-500 ${refreshing ? 'animate-spin' : ''}`}
+                    aria-hidden="true"
                   />
                 </button>
               )}
             </div>
 
-            <div className="flex flex-col gap-3 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700">
-              {(members.length <= 1 ? nearByUsers : members).length === 0 ? (
-                <div className="text-zinc-400 dark:text-zinc-600 text-sm text-center py-6">
-                  {members.length <= 1 ? 'No nearby users' : 'No members'}
-                </div>
+            <ul className="flex flex-col gap-2 overflow-y-auto">
+              {(members.length > 1 ? members : nearByUsers).length === 0 ? (
+                <li className="text-zinc-400 dark:text-zinc-500 text-sm py-6 text-center">
+                  {members.length > 1 ? 'No members' : 'No nearby devices found'}
+                </li>
               ) : (
-                (members.length <= 1 ? nearByUsers : members).map((m, idx) => (
-                  <button
-                    key={idx}
-                    onClick={() => members.length <= 1 && inviteToFlight(m, flight)}
-                    className="w-full flex items-center gap-3 rounded-xl px-4 py-2 border border-zinc-200 dark:border-zinc-800 hover:border-orange-400 dark:hover:border-orange-500 hover:bg-orange-50 dark:hover:bg-orange-950/10 transition text-left focus:ring-2 focus:ring-orange-200"
-                    title={members.length <= 1 ? `Connect to ${m.name}` : m.name}
-                  >
-                    <User className="w-6 h-6 text-orange-500 bg-orange-100 dark:bg-orange-900/30 hover:bg-orange-300 dark:hover:bg-orange-700 rounded-full p-1" />
-                    <div className="flex flex-col">
-                      <span className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate">
-                        {m.name}
-                      </span>
-                      <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono truncate">
-                        ID: {m.id}
-                      </span>
-                    </div>
-                  </button>
+                (members.length > 1 ? members : nearByUsers).map((peer) => (
+                  <li key={peer.id}>
+                    <button
+                      type="button"
+                      disabled={members.length > 1}
+                      onClick={() =>
+                        members.length > 1
+                          ? undefined
+                          : void runInvite(
+                              () =>
+                                inThisFlight
+                                  ? inviteToFlight(peer, code)
+                                  : requestDirectConnect(peer.id),
+                              'Invitation sent',
+                            )
+                      }
+                      className="w-full flex items-center gap-3 rounded-xl px-3 py-2 border border-zinc-200 dark:border-zinc-800 hover:border-orange-400 text-left disabled:opacity-60 disabled:cursor-default"
+                    >
+                      <User className="w-6 h-6 text-orange-500" aria-hidden="true" />
+                      <span className="truncate text-sm font-medium">{peer.name}</span>
+                    </button>
+                  </li>
                 ))
               )}
-            </div>
+            </ul>
           </div>
         </section>
 
-        {/* Queue preview */}
-        <div className="mt-6 w-full space-y-6">
-          <QueueTray
-            title="Transfer Queue"
-            items={[...queue, ...recvQueue]}
-            pauseTransfer={pauseTransfer}
-            resumeTransfer={resumeTransfer}
-            cancelTransfer={cancelTransfer}
-            fileDownload={downloadFile}
-            autoDownload={autoDownload}
-            setAutoDownload={setAutoDownload}
-          />
-        </div>
+        <QueueTray
+          title="Transfers"
+          items={[...queue, ...recvQueue]}
+          onPause={pauseTransfer}
+          onResume={resumeTransfer}
+          onCancel={(id, kind) => (kind === 'receive' ? cancelReceive(id) : cancelTransfer(id))}
+          onDownload={(item) => downloadFile(item as never)}
+        />
 
-        {/* Metrics and share info */}
         <section className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <MetricsSection meta={meta} />
-          <AsktoShareSection />
+          <MetricsSection metrics={metrics} />
+          <AskToShareSection />
         </section>
       </div>
+
+      {showQr && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fadeIn"
+          onClick={() => setShowQr(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Share this flight"
+            onClick={(e) => e.stopPropagation()}
+            className="relative bg-white dark:bg-zinc-900 rounded-3xl shadow-2xl p-8 w-full max-w-xs flex flex-col items-center border-2 border-orange-400"
+          >
+            <button
+              ref={qrClose}
+              type="button"
+              onClick={() => setShowQr(false)}
+              aria-label="Close"
+              className="absolute top-3 right-3 text-zinc-400 hover:text-orange-600"
+            >
+              <X className="w-5 h-5" aria-hidden="true" />
+            </button>
+
+            <p className="font-mono text-lg bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-400 px-3 py-1 rounded-lg">
+              {code}
+            </p>
+            <h2 className="mt-3 text-xl font-bold text-center">Share this flight</h2>
+
+            <div className="my-4 p-2 bg-white rounded-xl">
+              <QRCodeSVG value={origin} size={180} />
+            </div>
+
+            <div className="w-full flex items-center gap-2">
+              <label htmlFor="share-url" className="sr-only">
+                Flight link
+              </label>
+              <input
+                id="share-url"
+                readOnly
+                value={origin}
+                onFocus={(e) => e.currentTarget.select()}
+                className="flex-1 bg-zinc-100 dark:bg-zinc-800 rounded-lg px-2 py-1 text-sm font-mono border border-zinc-200 dark:border-zinc-700"
+              />
+              <button
+                type="button"
+                onClick={async () => {
+                  if (navigator.share) {
+                    await navigator
+                      .share({ title: 'Join my flight', url: origin })
+                      .catch(() => undefined);
+                  } else {
+                    await navigator.clipboard?.writeText(origin);
+                    setNotice('Link copied to your clipboard.');
+                  }
+                }}
+                aria-label="Share flight link"
+                className="p-2 rounded hover:bg-orange-100 dark:hover:bg-orange-900/30 text-orange-600"
+              >
+                <Share2 className="w-5 h-5" aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

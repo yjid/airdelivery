@@ -2,62 +2,55 @@
 
 import Image from 'next/image';
 import Link from 'next/link';
-import React from 'react';
 import { Github } from 'lucide-react';
 import ThemeToggle from './ThemeToggle';
 
+const REPO_URL = process.env.NEXT_PUBLIC_REPO_URL ?? 'https://github.com/GochiStuff/airdelivery';
+
 export default function Header() {
   return (
-    <>
-      <header className="w-full h-16 flex items-center justify-between px-6 md:px-10 bg-white/80 dark:bg-zinc-950/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800 sticky top-0 z-50 transition-all duration-300">
-        {/* Brand Section */}
+    <header className="sticky top-0 z-50 w-full h-16 flex items-center justify-between px-4 md:px-10 bg-white/80 dark:bg-zinc-950/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800">
+      <Link
+        href="/"
+        className="flex items-center gap-2.5 active:scale-95 transition-transform"
+        aria-label="AirDelivery home"
+      >
+        <Image
+          src="/icons/logo.png"
+          alt=""
+          width={36}
+          height={36}
+          className="object-contain"
+          priority
+        />
+        <span className="text-lg sm:text-xl font-bold tracking-tighter text-zinc-900 dark:text-zinc-100 uppercase select-none">
+          Air Delivery
+        </span>
+      </Link>
+
+      <nav aria-label="Main" className="flex items-center gap-1 sm:gap-4">
+        <div className="hidden md:flex items-center gap-4">
+          <ThemeToggle />
+        </div>
+
         <Link
-          href="/"
-          className="flex items-center gap-2.5 group active:scale-95 transition-transform"
+          href="/guide/p2p-file-sharing"
+          className="hidden sm:inline text-sm font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 transition-colors"
         >
-          <Image
-            src="/icons/logo.png"
-            alt="AirDelivery Logo"
-            width={36}
-            height={36}
-            className="object-contain"
-            priority
-          />
-          <span className="text-xl font-bold tracking-tighter text-zinc-900 dark:text-zinc-100 uppercase select-none">
-            AIR DELIVERY
-          </span>
+          How it works
         </Link>
 
-        {/* Action Group */}
-        <nav className="flex items-center gap-1 sm:gap-4">
-          {/* PC Only Icons */}
-          <div className="hidden md:flex items-center gap-4">
-            <ThemeToggle />
-            <a
-              href="https://x.com/imgochi"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="p-2 text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors"
-              title="Follow on X"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true" className="w-4.5 h-4.5 fill-current">
-                <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path>
-              </svg>
-            </a>
-          </div>
-
-          {/* Persistent GitHub Link */}
-          <a
-            href="https://github.com/GochiStuff/airdelivery"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="p-2 text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors"
-            title="Star on GitHub"
-          >
-            <Github className="w-5 h-5" />
-          </a>
-        </nav>
-      </header>
-    </>
+        <a
+          href={REPO_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="p-2 text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors"
+          aria-label="Source code on GitHub"
+          title="Source code on GitHub"
+        >
+          <Github className="w-5 h-5" aria-hidden="true" />
+        </a>
+      </nav>
+    </header>
   );
 }

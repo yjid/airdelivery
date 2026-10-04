@@ -1,214 +1,201 @@
-import type { Metadata } from 'next';
-import { Geist_Mono, Inter } from 'next/font/google';
-import './globals.css';
-import { SocketProvider } from '@/context/socketContext';
-import Header from '@/components/header';
-import { Analytics } from '@vercel/analytics/next';
+import type { Metadata, Viewport } from 'next';
+import { Inter, Geist_Mono } from 'next/font/google';
 import Script from 'next/script';
-import FooterStrip from '@/components/footer';
+import { Analytics } from '@vercel/analytics/next';
+import './globals.css';
 import Providers from './providers';
+import Header from '@/components/header';
+import FooterStrip from '@/components/footer';
 
+const SITE_URL = 'https://airdelivery.site';
 const GA_ID = process.env.NEXT_PUBLIC_GA_ID;
+const ADSENSE_ID = process.env.NEXT_PUBLIC_ADSENSE_ID;
 
-const inter = Inter({
-  variable: '--font-sans',
-  subsets: ['latin'],
-});
+const inter = Inter({ variable: '--font-sans', subsets: ['latin'], display: 'swap' });
+const geistMono = Geist_Mono({ variable: '--font-mono', subsets: ['latin'], display: 'swap' });
 
-const geistMono = Geist_Mono({
-  variable: '--font-mono',
-  subsets: ['latin'],
-});
+const DESCRIPTION =
+  'Send files instantly and privately, peer to peer over WebRTC. No uploads, no sign-up, no size limits. Your files never touch a server.';
 
 export const metadata: Metadata = {
-  title: {
-    default: 'Air Delivery',
-    template: '%s | Secure & Instant P2P File Sharing',
-  },
-  description:
-    'Air Delivery lets you send large files instantly and securely with peer-to-peer WebRTC. No uploads, no sign-up, no file size limits. Just fast, private browser-to-browser sharing.',
-  applicationName: 'Air Delivery',
-  authors: [{ name: 'Yash Jangid', url: 'https://x.com/imgochi' }],
+  metadataBase: new URL(SITE_URL),
+  title: { default: 'AirDelivery — Private P2P File Transfer', template: '%s | AirDelivery' },
+  description: DESCRIPTION,
+  applicationName: 'AirDelivery',
   keywords: [
     'send large files',
-    'free file sharing',
     'peer to peer file sharing',
     'p2p file transfer',
-    'web based file sharing',
-    'no signup file transfer',
-    'encrypted file sharing',
-    'direct browser file sharing',
-    'large file transfer online',
     'webrtc file transfer',
-    'instant file sharing',
-    'secure p2p file transfer',
-    'file sharing without upload',
-    'open source',
     'airdrop alternative',
     'sharedrop alternative',
+    'snapdrop alternative',
+    'wormhole alternative',
     'file transfer without cloud',
+    'private file sharing',
+    'no signup file transfer',
+    'large file transfer online',
+    'encrypted file sharing',
     'anonymous file sharing',
-    'fast browser file transfer',
-    'p2p file transfer no limits',
-    'send files peer to peer',
+    'open source file sharing',
   ],
-
-  metadataBase: new URL('https://airdelivery.site'),
+  alternates: { canonical: SITE_URL },
   openGraph: {
-    title: 'Air Delivery – Secure & Instant P2P File Sharing',
-    description:
-      'Air Delivery lets you send large files instantly and securely with peer-to-peer WebRTC. No uploads, no sign-up, no file size limits. Just fast, private browser-to-browser sharing.',
-    url: 'https://airdelivery.site',
-    siteName: 'Air Delivery',
-    images: [
-      {
-        url: '/og-banner.png',
-        width: 1200,
-        height: 630,
-        alt: 'Air Delivery – Secure & Instant P2P File Sharing',
-      },
-    ],
-    locale: 'en_US',
     type: 'website',
+    siteName: 'AirDelivery',
+    locale: 'en_US',
+    url: SITE_URL,
+    title: 'AirDelivery — Private P2P File Transfer',
+    description: DESCRIPTION,
+    images: [{ url: '/og-banner.png', width: 1200, height: 630, alt: 'AirDelivery' }],
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Air Delivery – Secure & Instant P2P File Sharing',
-    description:
-      'Instantly send large files via peer-to-peer WebRTC—no cloud, no sign-up, no limits. Secure, encrypted, browser-to-browser transfer.',
+    title: 'AirDelivery — Private P2P File Transfer',
+    description: DESCRIPTION,
     images: ['/og-banner.png'],
-    creator: '@imgochi',
   },
   icons: {
-    icon: '/favicon.ico',
-    shortcut: '/favicon.ico',
+    icon: [{ url: '/favicon.ico' }, { url: '/icons/192.png', type: 'image/png', sizes: '192x192' }],
     apple: '/icons/apple.png',
   },
   manifest: '/manifest.json',
-  robots: {
-    index: true,
-    follow: true,
-  },
-  alternates: {
-    canonical: 'https://airdelivery.site',
-  },
+  robots: { index: true, follow: true },
 };
 
-export const viewport = {
+export const viewport: Viewport = {
   width: 'device-width',
   initialScale: 1,
+  viewportFit: 'cover',
+  themeColor: [
+    { media: '(prefers-color-scheme: light)', color: '#ffffff' },
+    { media: '(prefers-color-scheme: dark)', color: '#09090b' },
+  ],
 };
 
-export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  // JSON-LD structured data kept identical to original
-  const jsonLd = {
-    '@context': 'https://schema.org',
-    '@graph': [
-      {
-        '@type': 'WebSite',
-        '@id': 'https://airdelivery.site/#website',
-        url: 'https://airdelivery.site/',
-        name: 'Air Delivery',
-        description: 'p2p file sharing with no size limits, no cloud, end‑to‑end encryption.',
-        publisher: {
-          '@id': 'https://airdelivery.site/#organization',
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'WebApplication',
+      name: 'AirDelivery',
+      url: `${SITE_URL}/`,
+      applicationCategory: 'UtilitiesApplication',
+      operatingSystem: 'Any',
+      browserRequirements: 'Requires JavaScript and WebRTC',
+      description: DESCRIPTION,
+      license: 'https://opensource.org/licenses/MIT',
+      offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+      featureList: [
+        'Peer-to-peer WebRTC transfers',
+        'No accounts required',
+        'No server-side file storage',
+        'Progress, pause and resume',
+        'SHA-256 integrity verification',
+      ],
+    },
+    {
+      '@type': 'FAQPage',
+      mainEntity: [
+        {
+          '@type': 'Question',
+          name: 'Does the server ever see my files?',
+          acceptedAnswer: {
+            '@type': 'Answer',
+            text: 'No. The server only relays the WebRTC handshake so the two browsers can connect directly. File data never reaches it.',
+          },
         },
-        logo: {
-          '@type': 'ImageObject',
-          url: 'https://airdelivery.site/icons/192.png',
+        {
+          '@type': 'Question',
+          name: 'Why will it not connect on my network?',
+          acceptedAnswer: {
+            '@type': 'Answer',
+            text: 'Some campus and corporate networks block the peer-to-peer connections WebRTC needs. A TURN relay has to be configured on the server for those networks to work. Home and local networks are unaffected.',
+          },
         },
-      },
-      {
-        '@type': 'Organization',
-        '@id': 'https://airdelivery.site/#organization',
-        name: 'Air Delivery',
-        url: 'https://airdelivery.site/',
-        logo: {
-          '@type': 'ImageObject',
-          url: 'https://airdelivery.site/favicon.ico',
-        },
-        sameAs: ['https://x.com/imgochi'],
-      },
-      {
-        '@type': 'SoftwareApplication',
-        name: 'Air Delivery',
-        operatingSystem: 'All',
-        applicationCategory: 'WebApplication',
-        browserRequirements: 'Requires JavaScript',
-        url: 'https://airdelivery.site/',
-        description:
-          'Free peer-to-peer file sharing tool using secure direct browser connections. No upload, no sign-up, just send.',
-        offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
-      },
-    ],
-  };
+      ],
+    },
+  ],
+};
 
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <head>
         <meta charSet="utf-8" />
-        <meta itemProp="image" content="https://airdelivery.site/icons/512.png" />
-
-        {/* PWA & Performance Hints */}
-        <meta name="theme-color" content="#000000" />
-        <meta name="mobile-web-app-capable" content="yes" />
-        <meta name="author" content="Yash Jangid" />
-        <link rel="canonical" href="https://airdelivery.site" />
-        <link rel="icon" href="/favicon.ico" />
-
-        <meta name="google-adsense-account" content="ca-pub-6215596158227491" />
-
-        <link rel="manifest" href="/manifest.json" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link rel="preconnect" href="https://www.googletagmanager.com" />
-        <link rel="preconnect" href="https://www.google-analytics.com" />
-
+        <link rel="manifest" href="/manifest.json" />
         <script
           type="application/ld+json"
+          // Static, developer-authored JSON. No user input reaches this string.
           dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
         />
       </head>
-
-      {/* Google Analytics - loaded after interactive to avoid blocking render */}
-      {GA_ID && (
-        <>
-          <Script
-            src={`https://www.googletagmanager.com/gtag/js?id=${GA_ID}`}
-            strategy="afterInteractive"
-          />
-          <Script id="google-analytics" strategy="afterInteractive">
-            {`
-        window.dataLayer = window.dataLayer || [];
-        function gtag(){dataLayer.push(arguments);}
-        gtag('js', new Date());
-        gtag('config', '${GA_ID}');
-      `}
-          </Script>
-        </>
-      )}
-
       <body className={`${inter.variable} ${geistMono.variable} font-sans antialiased`}>
-        {/* @ts-ignore */}
-        <amp-auto-ads type="adsense" data-ad-client="ca-pub-6215596158227491" />
+        <Providers>
+          <a
+            href="#main"
+            className="sr-only focus:not-sr-only focus:absolute focus:z-[60] focus:m-2 focus:rounded-lg focus:bg-orange-600 focus:px-4 focus:py-2 focus:text-white"
+          >
+            Skip to content
+          </a>
+          <Header />
+          {children}
+          <FooterStrip />
+        </Providers>
 
-        <SocketProvider>
-          <Providers>
-            <Header />
-            {children}
-            <FooterStrip />
-          </Providers>
-        </SocketProvider>
+        {GA_ID && (
+          <>
+            <Script
+              src={`https://www.googletagmanager.com/gtag/js?id=${GA_ID}`}
+              strategy="afterInteractive"
+            />
+            <Script id="google-analytics" strategy="afterInteractive">
+              {`
+                window.dataLayer = window.dataLayer || [];
+                function gtag(){dataLayer.push(arguments);}
+                gtag('js', new Date());
+                gtag('config', '${GA_ID}', { anonymize_ip: true });
+              `}
+            </Script>
+          </>
+        )}
+
+        {/*
+          Auto-ads requires an actual script tag. The previous markup rendered a
+          bare <amp-auto-ads> element with no loader, which React treated as an
+          unknown DOM node and which never initialised AdSense at all.
+        */}
+        {ADSENSE_ID && (
+          <Script
+            id="adsense-auto-ads"
+            strategy="afterInteractive"
+            dangerouslySetInnerHTML={{
+              __html: `
+                (adsbygoogle = window.adsbygoogle || []).push({
+                  google_ad_client: "${ADSENSE_ID}",
+                  enable_page_level_ads: true
+                });
+                (function(){
+                  var s = document.createElement('script');
+                  s.src = "https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${ADSENSE_ID}";
+                  s.async = true;
+                  document.head.appendChild(s);
+                })();
+              `,
+            }}
+          />
+        )}
 
         <Analytics />
         <Script id="register-sw" strategy="afterInteractive">
           {`
-            if ('serviceWorker' in navigator) {
-              window.addEventListener('load', function() {
-                navigator.serviceWorker.register('/sw.js').then(function(registration) {
-                  console.log('SW registered');
-                }).catch(function(err) {
-                  console.log('SW registration failed: ', err);
+            if ('serviceWorker' in navigator && location.protocol === 'https:') {
+              window.addEventListener('load', function () {
+                navigator.serviceWorker.register('/sw.js').catch(function () {
+                  // Registration is an optimisation. Failing to register must
+                  // never surface to the user.
                 });
               });
             }

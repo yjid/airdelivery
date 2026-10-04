@@ -1,125 +1,173 @@
-// components/TermsModal.tsx
 'use client';
 
-import { useEffect } from 'react';
+/**
+ * Terms and privacy notice.
+ *
+ * Previously duplicated in two files (`terms.tsx` and `infoComponent.tsx`) with
+ * slightly different wording, so the two copies had already drifted. There is
+ * one copy now.
+ *
+ * Supports two usages: a self-contained trigger for the footer, and a
+ * controlled variant for the home page, which must show it as a precondition
+ * before creating a flight.
+ *
+ * `infoComponent.tsx` also imported a non-existent `icons` export from
+ * lucide-react and referenced a `router` it never used. It was deleted.
+ */
 
-export type TermsModalProps = {
-  show: boolean;
-  onClose: () => void;
-  onAccept?: () => void;
-};
+import { useEffect, useRef, useState } from 'react';
+import { X } from 'lucide-react';
 
-const termsContent = [
+const SECTIONS: Array<{ heading: string; items: string[] }> = [
   {
-    heading: '',
+    heading: '1. File transfers',
     items: [
-      'By using this service, you agree to these terms. If you do not agree, please do not use Air Delivery.',
+      'AirDelivery transfers files directly between two browsers using a peer-to-peer WebRTC connection.',
+      'The server facilitates the connection and nothing else. File data is never uploaded to, stored on, or routed through a server we operate.',
+      'Transfers are ephemeral. Nothing is retained after you close the tab.',
     ],
   },
   {
-    heading: '1. File Transfers',
+    heading: '2. Privacy',
     items: [
-      'Air Delivery enables you to send files directly between two devices using p2p connections.',
-      'Files are never uploaded to or stored on any server we control. We only facilitate the signaling connection needed to establish the direct link.',
-      'Transfers are ephemeral and end as soon as the browser tab is closed or the session ends.',
+      'No accounts. We do not ask for or store your name, email, or any identifier that follows you.',
+      'Your IP address is used transiently to discover devices on your own local network, and is discarded when you disconnect. It is never written to logs in raw form.',
+      'Aggregate counters — files transferred and total bytes, with no file names, contents, or addresses — are used to understand usage.',
     ],
   },
   {
-    heading: '2. Privacy & Data Handling',
+    heading: '3. Acceptable use',
     items: [
-      'We do not collect or store personal information such as names, emails, or files.',
-      'Your IP address may be partially used to discover nearby users on the same network. This data is never stored or shared.',
-      'We use basic analytics tools to understand usage trends, including the total transfer size across all users. These tools may set cookies or collect anonymized device/browser information to help us improve the service.',
+      'Do not use AirDelivery to distribute unlawful, infringing, or harmful content. You are solely responsible for what you share.',
+      'Automated abuse of the signaling server is not permitted.',
+      'We may block traffic that is attacking the infrastructure or violating these terms.',
     ],
   },
   {
-    heading: '3. Acceptable Use',
+    heading: '4. Availability',
     items: [
-      'You agree not to use Air Delivery to share content that is illegal, harmful, or violates intellectual property rights.',
-      'You are solely responsible for the files you choose to share.',
-      'We reserve the right to block IPs or users abusing the platform, including spamming, malicious use, or attempts to overload infrastructure.',
+      'The service is provided as-is, with no guarantee of uptime.',
+      'Browser-to-browser connections can be blocked by a network. A relay has to be configured by whoever runs the server for restrictive corporate or campus networks to work; home and local networks are unaffected.',
+      'Because the transfer is direct, throughput depends entirely on the two devices and the network between them.',
     ],
   },
   {
-    heading: '4. Security Disclaimer',
+    heading: '5. Licence',
     items: [
-      'Air Delivery encryptes the data, direct connections, but we cannot guarantee absolute security due to the nature of internet communication.',
-      'Always verify the recipient and file before accepting a transfer. We are not responsible for any damages, losses, or issues resulting from file sharing via Air Delivery.',
+      'AirDelivery is free and open source under the MIT licence. You may self-host it, inspect it, and modify it.',
     ],
-  },
-  {
-    heading: '5. Limitation of Liability',
-    items: [
-      "This service is provided 'as is' without warranties of any kind.",
-      'We are not liable for data loss, failed transfers, or any damages arising from use or misuse of the service.',
-    ],
-  },
-  {
-    heading: 'Updates to These Terms',
-    items: ['Last updated: June 20, 2025'],
   },
 ];
 
-export default function TermsModal({ show, onClose, onAccept }: TermsModalProps) {
-  useEffect(() => {
-    if (show) document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = '';
-    };
-  }, [show]);
+function useDismissable(show: boolean, onClose: () => void) {
+  const panel = useRef<HTMLDivElement>(null);
 
+  useEffect(() => {
+    if (!show) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    // Move focus into the dialog so keyboard and screen-reader users are not
+    // left behind on the page underneath.
+    panel.current?.focus();
+    return () => window.removeEventListener('keydown', onKey);
+  }, [show, onClose]);
+
+  return panel;
+}
+
+interface TermsProps {
+  show: boolean;
+  onClose: () => void;
+  onAccept?: () => void;
+}
+
+function TermsPanel({ show, onClose, onAccept }: TermsProps) {
+  const panel = useDismissable(show, onClose);
   if (!show) return null;
 
   return (
     <div
-      role="dialog"
-      aria-modal="true"
-      className="fixed inset-0 z-60 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+      className="fixed inset-0 z-[70] flex items-start justify-center bg-black/60 backdrop-blur-sm p-4 overflow-auto animate-fadeIn"
       onClick={onClose}
     >
       <div
-        className="bg-white text-zinc-900 max-w-2xl w-full mx-4 p-5 rounded-2xl shadow-xl relative max-h-[80vh] overflow-y-auto"
+        ref={panel}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="terms-heading"
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
+        className="bg-white dark:bg-zinc-900 rounded-2xl max-w-2xl w-full p-6 md:p-8 my-8 shadow-2xl text-zinc-800 dark:text-zinc-200 outline-none"
       >
         <button
+          type="button"
           onClick={onClose}
           aria-label="Close"
-          className="absolute top-3 right-3 text-zinc-500 hover:text-red-500"
+          className="absolute right-4 top-4 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-100"
         >
-          ✕
+          <X className="w-5 h-5" aria-hidden="true" />
         </button>
-        <h2 className="text-xl font-semibold mb-2">Terms & Privacy</h2>
 
-        <section className="space-y-6 text-sm text-zinc-800">
-          {termsContent.map(({ heading, items }, idx) => (
-            <div key={idx}>
-              {heading && <h3 className="text-base font-medium mb-2">{heading}</h3>}
-              <ul className="list-disc list-inside space-y-1">
-                {items.map((item, i) => (
-                  <li key={i}>{item}</li>
+        <h2 id="terms-heading" className="text-2xl font-bold mb-4 pr-8">
+          Terms &amp; privacy
+        </h2>
+
+        <div className="space-y-5 text-sm leading-relaxed max-h-[60vh] overflow-y-auto pr-2">
+          {SECTIONS.map((section) => (
+            <section key={section.heading}>
+              <h3 className="font-semibold mb-1">{section.heading}</h3>
+              <ul className="list-disc list-inside space-y-1 text-zinc-600 dark:text-zinc-400">
+                {section.items.map((item) => (
+                  <li key={item}>{item}</li>
                 ))}
               </ul>
-            </div>
+            </section>
           ))}
-        </section>
+        </div>
 
-        {onAccept && (
-          <div className="mt-6 flex justify-end gap-4">
-            <button onClick={onClose} className="text-sm text-zinc-500 hover:text-zinc-700">
-              Decline
-            </button>
+        <div className="flex flex-wrap justify-end gap-3 mt-6">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-5 py-2.5 rounded-full border border-zinc-300 dark:border-zinc-700 font-medium transition hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          >
+            Close
+          </button>
+          {onAccept && (
             <button
-              onClick={() => {
-                onAccept();
-                onClose();
-              }}
-              className="bg-orange-500 text-white text-sm px-4 py-2 rounded hover:bg-orange-600"
+              type="button"
+              onClick={onAccept}
+              className="px-5 py-2.5 rounded-full bg-orange-600 hover:bg-orange-700 text-white font-semibold transition"
             >
-              Accept Terms
+              Accept and continue
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </div>
     </div>
+  );
+}
+
+/** Controlled variant, used by the home page before creating a flight. */
+export function TermsModal({ show, onClose, onAccept }: TermsProps) {
+  return <TermsPanel show={show} onClose={onClose} onAccept={onAccept} />;
+}
+
+/** Self-contained variant, used in the footer. */
+export default function TermsTrigger() {
+  const [show, setShow] = useState(false);
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setShow(true)}
+        className="hover:text-orange-500 transition-colors"
+      >
+        Terms &amp; privacy
+      </button>
+      <TermsPanel show={show} onClose={() => setShow(false)} />
+    </>
   );
 }

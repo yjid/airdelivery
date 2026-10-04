@@ -98,8 +98,6 @@ export default function Page() {
       title: 'Why Use Browser-Based P2P Over Traditional Apps?',
     },
   ];
-
-  const authorName = 'Yash Jangid';
   const lastUpdated = 'June 24, 2025';
 
   return (

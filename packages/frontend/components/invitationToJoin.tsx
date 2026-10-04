@@ -1,36 +1,66 @@
-import React, { useEffect, useState } from 'react';
-import { useSocket } from '../context/socketContext';
-import { useRouter } from 'next/navigation';
+'use client';
 
-type Invitation = {
+/**
+ * Flight invitation popup.
+ *
+ * This was a hook that *returned JSX*, which breaks the rules of hooks: it
+ * cannot be called conditionally, it defeats Fast Refresh, and it forces every
+ * consumer to render a value that looks like a component. It is a component now.
+ *
+ * It also used `z-500`, which is not a Tailwind class, so the popup had no
+ * z-index at all and rendered underneath the sticky header.
+ */
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { EV } from '@airdelivery/protocol';
+import { useSocket } from '@/context/socketContext';
+
+interface Invitation {
   flightCode: string;
   fromId: string;
   fromName: string;
-};
+}
 
-export function useInvitationToJoin() {
-  const [invitation, setInvitation] = useState<Invitation | null>(null);
-  const [timer, setTimer] = useState(60); // seconds
+const TIMEOUT_SECONDS = 60;
+
+export function InvitationToJoin() {
   const { socket } = useSocket();
+  const [invitation, setInvitation] = useState<Invitation | null>(null);
+  const [remaining, setRemaining] = useState(TIMEOUT_SECONDS);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const router = useRouter();
 
   useEffect(() => {
     if (!socket) return;
 
-    const handleInvitedToFlight = ({ flightCode, fromId, fromName }: Invitation) => {
-      setInvitation({ flightCode, fromId, fromName });
-      setTimer(60);
+    // Registered with an explicit reference so `off` removes only this one.
+    const onInvited = (payload: Invitation) => {
+      setInvitation(payload);
+      setRemaining(TIMEOUT_SECONDS);
+      closeButton.current?.focus();
     };
 
-    socket.on('invitedToFlight', handleInvitedToFlight);
+    socket.on(EV.invitedToFlight, onInvited);
     return () => {
-      socket.off('invitedToFlight', handleInvitedToFlight);
+      socket.off(EV.invitedToFlight, onInvited);
     };
   }, [socket]);
 
+  // Escape dismisses, which is expected of any dialog.
   useEffect(() => {
     if (!invitation) return;
-    const interval = setInterval(() => {
-      setTimer((prev) => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setInvitation(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [invitation]);
+
+  useEffect(() => {
+    if (!invitation) return;
+    const timer = setInterval(() => {
+      setRemaining((prev) => {
         if (prev <= 1) {
           setInvitation(null);
           return 0;
@@ -38,63 +68,61 @@ export function useInvitationToJoin() {
         return prev - 1;
       });
     }, 1000);
-    return () => clearInterval(interval);
-  }, [invitation, socket]);
+    return () => clearInterval(timer);
+  }, [invitation]);
 
-  const router = useRouter();
-
-  const accept = () => {
-    if (invitation) {
-      router.push(`/flight/${invitation.flightCode}`);
-      setInvitation(null);
-    }
-  };
-
-  const decline = () => {
+  const accept = useCallback(() => {
+    if (!invitation) return;
+    router.push(`/flight/${invitation.flightCode}`);
     setInvitation(null);
-  };
+  }, [invitation, router]);
 
-  const InvitationPopup = invitation ? (
-    <div className="fixed top-4 right-4 z-500  animate-fadeIn">
-      <div className="bg-white border shadow-xl rounded-2xl  w-xs sm:w-sm overflow-hidden">
+  if (!invitation) return null;
+
+  return (
+    <div
+      role="dialog"
+      aria-labelledby="invite-title"
+      className="fixed top-20 right-4 z-[60] animate-fadeIn"
+    >
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 shadow-xl rounded-2xl w-72 sm:w-96 overflow-hidden">
         <div className="p-4">
-          <h2 className="text-lg font-bold text-gray-800 mb-1">
-            Join Flight
+          <h2 id="invite-title" className="text-lg font-bold text-zinc-800 dark:text-zinc-100 mb-1">
+            Join flight{' '}
             <span className="font-mono font-extrabold text-orange-600">
-              {' '}
               {invitation.flightCode}
-            </span>{' '}
-            ?{' '}
+            </span>
+            ?
           </h2>
-          <p className="text-md text-gray-600 mb-3">
+          <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-4">
             <span className="font-medium">{invitation.fromName}</span> wants to send you files.
-            <br />
-            <span className="text-sm text-gray-400">(from ID: {invitation.fromId})</span>
           </p>
           <div className="flex justify-end gap-2">
             <button
-              onClick={decline}
-              className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300 text-gray-700 text-md"
+              ref={closeButton}
+              type="button"
+              onClick={() => setInvitation(null)}
+              className="px-3 py-1.5 rounded-lg bg-zinc-200 hover:bg-zinc-300 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-200 text-sm"
             >
               Decline
             </button>
             <button
+              type="button"
               onClick={accept}
-              className="px-3 py-1 rounded bg-orange-600 hover:bg-orange-700 text-white text-md"
+              className="px-3 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-700 text-white text-sm font-medium"
             >
               Accept
             </button>
           </div>
         </div>
-        <div className="h-1 w-full bg-gray-200 relative overflow-hidden">
+        <div className="h-1 w-full bg-zinc-200 dark:bg-zinc-800 relative overflow-hidden">
           <div
-            className="absolute top-0 left-0 h-full bg-orange-500 transition-all duration-1000"
-            style={{ width: `${(timer / 60) * 100}%` }}
+            aria-hidden="true"
+            className="absolute inset-y-0 left-0 bg-orange-500 transition-all duration-1000"
+            style={{ width: `${(remaining / TIMEOUT_SECONDS) * 100}%` }}
           />
         </div>
       </div>
     </div>
-  ) : null;
-
-  return InvitationPopup;
+  );
 }
