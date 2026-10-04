@@ -60,14 +60,7 @@ import { collectFiles } from '@/utils/flattenFilelist';
 // ---------------------------------------------------------------------------
 
 export type TransferStatus =
-  | 'queued'
-  | 'sending'
-  | 'paused'
-  | 'done'
-  | 'error'
-  | 'canceled'
-  | 'receiving'
-  | 'verifying';
+  'queued' | 'sending' | 'paused' | 'done' | 'error' | 'canceled' | 'receiving' | 'verifying';
 
 export interface TransferItem {
   transferId: string;
