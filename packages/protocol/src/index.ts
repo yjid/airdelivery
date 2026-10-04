@@ -230,8 +230,7 @@ export const AckSchema = z.discriminatedUnion('ok', [
 ]);
 
 export type Ack =
-  | { ok: true; code?: string; members?: Member[] }
-  | { ok: false; code: string; message: string };
+  { ok: true; code?: string; members?: Member[] } | { ok: false; code: string; message: string };
 
 export const ackOk = (extra: Record<string, unknown> = {}): Ack => ({ ok: true, ...extra }) as Ack;
 
@@ -284,11 +283,7 @@ export type ServerToClientEvents = {
 };
 
 export type FlightDeletedReason =
-  | 'owner-left'
-  | 'peer-left'
-  | 'expired'
-  | 'replaced'
-  | 'server-shutdown';
+  'owner-left' | 'peer-left' | 'expired' | 'replaced' | 'server-shutdown';
 
 export type ClientToServerEvents = {
   [EV.createFlight]: (ack: (a: Ack) => void) => void;

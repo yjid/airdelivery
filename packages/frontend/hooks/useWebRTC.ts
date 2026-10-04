@@ -37,22 +37,10 @@ import { EV, type IceCandidatePayload, type Member, type SdpPayload } from '@air
 import { useSocket } from '@/context/socketContext';
 
 export type FlightStatus =
-  | 'idle'
-  | 'waiting'
-  | 'connecting'
-  | 'connected'
-  | 'reconnecting'
-  | 'disconnected'
-  | 'failed';
+  'idle' | 'waiting' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'failed';
 
 export type FailureCode =
-  | 'BAD_CODE'
-  | 'NOT_FOUND'
-  | 'FULL'
-  | 'BAD_PAYLOAD'
-  | 'SELF'
-  | 'OFFLINE'
-  | 'INTERNAL';
+  'BAD_CODE' | 'NOT_FOUND' | 'FULL' | 'BAD_PAYLOAD' | 'SELF' | 'OFFLINE' | 'INTERNAL';
 
 export interface SignalAck {
   ok: boolean;
