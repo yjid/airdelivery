@@ -67,7 +67,9 @@ function MetricCard({
       className={`rounded-2xl p-3 sm:p-4 flex flex-col justify-between shadow-sm border border-zinc-200 dark:border-zinc-800 ${cardBg}`}
     >
       <div className="flex items-center justify-between mb-1 sm:mb-2">
-        <span className="text-[10px] sm:text-xs text-zinc-500 dark:text-zinc-500 font-bold uppercase tracking-wider">{label}</span>
+        <span className="text-[10px] sm:text-xs text-zinc-500 dark:text-zinc-500 font-bold uppercase tracking-wider">
+          {label}
+        </span>
         <div className={`p-1.5 rounded-lg ${iconBg}`}>{icon}</div>
       </div>
       <span className="text-sm sm:text-lg lg:text-xl text-nowrap font-black text-zinc-900 dark:text-zinc-100 tabular-nums">

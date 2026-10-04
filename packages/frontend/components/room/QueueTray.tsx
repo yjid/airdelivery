@@ -178,7 +178,9 @@ export function QueueTray({
 }: QueueTrayProp) {
   const [show, setShow] = useState(false);
   const [fsSupported] = useState(() => supportsFSAccess());
-  const [savedTo, setSavedTo] = useState<string | null>(hasSaveDirectory() ? saveDirectoryName() : null);
+  const [savedTo, setSavedTo] = useState<string | null>(
+    hasSaveDirectory() ? saveDirectoryName() : null,
+  );
 
   useEffect(() => {
     setSavedTo(hasSaveDirectory() ? saveDirectoryName() : null);

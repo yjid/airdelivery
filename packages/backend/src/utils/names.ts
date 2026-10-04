@@ -1,4 +1,10 @@
-const namePool = [
+/**
+ * Display names for anonymous peers.
+ *
+ * Two lists so two people on the same network rarely collide on a name, which
+ * matters because names are the only identifier shown in the nearby list.
+ */
+const POOL = [
   'Pika',
   'Zard',
   'Eevee',
@@ -6,20 +12,19 @@ const namePool = [
   'Snorlax',
   'Ditto',
   'Mew',
-  'Lucar',
+  'Lucario',
   'Goomy',
-  'Toge',
-  'Gren',
+  'Togepi',
+  'Greninja',
   'Chomp',
-  'Infern',
+  'Infernape',
   'Bidoof',
-  'Sylv',
-  'Scorb',
-  'Quag',
-  'Zoroa',
-  'Sable',
+  'Sylveon',
+  'Scorbunny',
+  'Quagsire',
+  'Zorua',
+  'Sableye',
   'Piplup',
-
   'Luffy',
   'Zoro',
   'Goku',
@@ -33,16 +38,28 @@ const namePool = [
   'Killua',
   'Gon',
   'Gojo',
-  'Tanji',
+  'Tanjiro',
   'Nezuko',
   'Baki',
   'Yugi',
   'Natsu',
   'Shoto',
   'Lain',
-];
+  'Homer',
+  'Lisa',
+  'Bart',
+  'Stewie',
+  'Peter',
+  'Fry',
+  'Bender',
+] as const;
 
-export function getRandomName() {
-  const i = Math.floor(Math.random() * namePool.length);
-  return namePool[i];
+export function getRandomName(): string {
+  return POOL[Math.floor(Math.random() * POOL.length)];
+}
+
+/** Slightly fancier variant, used for flights created via a direct connect. */
+export function getRandomNameWithSuffix(): string {
+  const base = getRandomName();
+  return `${base}-${Math.floor(Math.random() * 90 + 10)}`;
 }
