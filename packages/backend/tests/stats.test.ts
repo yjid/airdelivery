@@ -20,7 +20,7 @@ import { StatManager } from '../src/services/StatManager.js';
 import { Stat } from '../src/model/stats.model.js';
 
 /** Swaps the model's updateOne for a test double. */
-function stubUpdateOne(impl: (filter: unknown, update: unknown, options: unknown) => unknown) {
+function stubUpdateOne(impl: (...args: never[]) => unknown) {
   (Stat as unknown as { updateOne: unknown }).updateOne = impl;
 }
 
@@ -87,18 +87,20 @@ describe('StatManager flushing', () => {
   test('does not write without a DB_URI', async () => {
     // The default test environment has no DB_URI, so the flush must no-op
     // rather than hang waiting on a connection that will never arrive.
-    stats.incFlights();
-    // Null, and the buffer is untouched rather than silently consumed.
+    // Null, and the buffer is left untouched rather than silently consumed.
     expect(await stats.flush()).toBeNull();
   });
 
   test('a failed flush restores the buffer rather than losing counts', async () => {
     // Force a rejection to simulate a transient Mongo outage.
-    stubUpdateOne(() => ({
-      exec: mock(async () => {
-        throw new Error('connection lost');
-      }),
-    }));
+    stubUpdateOne(
+      () =>
+        ({
+          exec: mock(async () => {
+            throw new Error('connection lost');
+          }),
+        }) as never,
+    );
 
     stats.incFlights(3);
     await stats.flush();
