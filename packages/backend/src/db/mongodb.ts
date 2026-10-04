@@ -26,11 +26,7 @@ export function isDbConnecting(): boolean {
 }
 
 export function dbState():
-  | 'disconnected'
-  | 'connected'
-  | 'connecting'
-  | 'disconnecting'
-  | 'unknown' {
+  'disconnected' | 'connected' | 'connecting' | 'disconnecting' | 'unknown' {
   switch (mongoose.connection.readyState) {
     case 0:
       return 'disconnected';
